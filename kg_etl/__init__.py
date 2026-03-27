@@ -1,0 +1,1 @@
+"""Board game knowledge graph ETL package."""

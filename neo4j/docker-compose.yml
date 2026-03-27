@@ -1,0 +1,21 @@
+services:
+  neo4j:
+    image: neo4j:5
+    container_name: dsci558-neo4j
+    ports:
+      - "7474:7474"
+      - "7687:7687"
+    environment:
+      - NEO4J_AUTH=neo4j/password
+      # Memory tuning for large CSV imports
+      - NEO4J_server_memory_pagecache_size=2G
+      - NEO4J_server_memory_heap_initial__size=2G
+      - NEO4J_server_memory_heap_max__size=4G
+      - NEO4J_dbms_memory_transaction_total_max=3G
+      # Keep tx timeout generous during long import batches
+      - NEO4J_dbms_transaction_timeout=30m
+    volumes:
+      - ./data:/data
+      - ./logs:/logs
+      - ./import:/import
+      - ./plugins:/plugins

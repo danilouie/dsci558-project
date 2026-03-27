@@ -1,0 +1,49 @@
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+from kg_etl.export_csvs import ExportConfig, export_all
+from kg_etl.paths import default_paths
+
+
+def main() -> None:
+    paths = default_paths()
+
+    parser = argparse.ArgumentParser(description="Export Neo4j-ready CSVs for board game KG.")
+    parser.add_argument(
+        "--out",
+        default=str(paths.neo4j_import_dir),
+        help="Output directory (Neo4j import dir). Defaults to neo4j/import/",
+    )
+    parser.add_argument("--limit-games", type=int, default=None)
+    parser.add_argument("--limit-price-files", type=int, default=None)
+    parser.add_argument("--limit-reviews", type=int, default=None)
+    parser.add_argument("--limit-ranks", type=int, default=None)
+    parser.add_argument("--no-fuzzy-reviews", action="store_true", default=False)
+    parser.add_argument("--review-min-score", type=int, default=92)
+    args = parser.parse_args()
+
+    cfg = ExportConfig(
+        out_dir=Path(args.out),
+        limit_games=args.limit_games,
+        limit_price_files=args.limit_price_files,
+        limit_reviews=args.limit_reviews,
+        limit_ranks=args.limit_ranks,
+        enable_review_fuzzy_match=(not args.no_fuzzy_reviews),
+        review_match_min_score=args.review_min_score,
+    )
+
+    counts = export_all(paths, cfg)
+    print("Export complete:")
+    for k, v in counts.items():
+        print(f"- {k}: {v}")
+
+
+if __name__ == "__main__":
+    main()
+
