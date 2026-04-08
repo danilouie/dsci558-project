@@ -14,7 +14,7 @@ import argparse
 from pathlib import Path
 
 # Config
-API_TOKEN   = "85cbfc9b-e2f9-4b82-b76c-1eaabb547586"
+API_TOKEN   = "INPUT KEY HERE"
 
 CSV_FILE    = Path(__file__).parent.parent / "boardgames_ranks.csv"
 OUTPUT_FILE = Path(__file__).parent / "games.jsonl"
