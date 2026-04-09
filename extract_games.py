@@ -3,6 +3,9 @@ import json
 import re
 import sys
 import ollama
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock
+import os
 
 def strip_html(text: str) -> str:
     return re.sub(r"<[^>]+>", "", text).strip()
@@ -22,6 +25,12 @@ Return ONLY valid JSON, no explanation:
 If no games are recommended, return: {"games": []}
 Only include games that are clearly being recommended, praised, suggested, or compared."""
 
+# --- Tunables ---
+MAX_WORKERS    = 8     # Parallel Ollama calls; raise if your machine handles it
+TEXT_LIMIT     = 1000  # Characters sent to the model per post
+PROGRESS_EVERY = 500   # Print progress every N posts
+
+
 def extract_games(post: dict) -> list[dict]:
     text = strip_html(post.get("response", ""))
     if not text:
@@ -31,13 +40,14 @@ def extract_games(post: dict) -> list[dict]:
         model="llama3",
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": f"Forum post:\n\n{text[:1000]}"}
+            {"role": "user",   "content": f"Forum post:\n\n{text[:TEXT_LIMIT]}"}
         ]
     )
 
     raw = response["message"]["content"].strip()
     raw = raw.replace("```json", "").replace("```", "").strip()
     parsed = json.loads(raw)
+    games = parsed if isinstance(parsed, list) else parsed.get("games", [])
 
     return [
         {
@@ -50,52 +60,86 @@ def extract_games(post: dict) -> list[dict]:
             "sentiment":           g["sentiment"],
             "evidence":            g["evidence"],
         }
-        for g in parsed.get("games", [])
+        for g in games
     ]
 
+
+def load_already_processed(output_file: str) -> set:
+    """Return thread_ids already written so we can skip them on resume."""
+    seen = set()
+    if not os.path.exists(output_file):
+        return seen
+    with open(output_file, encoding="utf-8") as f:
+        for line in f:
+            try:
+                seen.add(json.loads(line)["thread_id"])
+            except Exception:
+                pass
+    return seen
+
+
 def main():
-    # Get input file from command line, or prompt if not provided
     if len(sys.argv) < 2:
         input_file = input("Enter path to your JSONL file: ").strip()
     else:
         input_file = sys.argv[1]
 
-    # Auto-name output file based on input filename
     output_file = input_file.replace(".jsonl", "_extracted_games.jsonl")
 
-    print(f"Input:  {input_file}")
-    print(f"Output: {output_file}")
-    print("Starting extraction...\n")
+    already_done = load_already_processed(output_file)
+    if already_done:
+        print(f"Resuming — {len(already_done):,} thread_ids already done, skipping.")
 
-    results = []
-    skipped = 0
-    total = 0
+    print(f"Input:   {input_file}\nOutput:  {output_file}\nWorkers: {MAX_WORKERS}")
+    print("Loading posts...\n")
 
-    with open(input_file) as f:
-        for i, line in enumerate(f):
+    posts = []
+    with open(input_file, encoding="utf-8") as f:
+        for line in f:
             line = line.strip()
             if not line:
                 continue
-            total += 1
             try:
                 post = json.loads(line)
-                games = extract_games(post)
-                results.extend(games)
-            except (json.JSONDecodeError, KeyError) as e:
-                skipped += 1
-                print(f"  Line {i+1} error: {e}")
-            if (i + 1) % 10 == 0:
-                print(f"  Processed {i+1} posts → {len(results)} games found so far...")
+                if post.get("metadata", {}).get("thread_id") not in already_done:
+                    posts.append(post)
+            except json.JSONDecodeError:
+                pass
 
-    with open(output_file, "w") as f:
-        for r in results:
-            f.write(json.dumps(r) + "\n")
+    print(f"Posts to process: {len(posts):,}  (skipped {len(already_done):,} already done)\n")
 
-    print(f"\n✓ Done!")
-    print(f"  Posts processed:      {total}")
-    print(f"  Posts skipped:        {skipped}")
-    print(f"  Games extracted:      {len(results)}")
-    print(f"  Output saved to:      {output_file}")
+    write_lock = Lock()
+    counters = {"processed": 0, "skipped": 0, "games": 0}
+
+    def process(post):
+        try:
+            return extract_games(post)
+        except Exception as e:
+            return e
+
+    with open(output_file, "a", encoding="utf-8") as out_f:
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            futures = {executor.submit(process, p): p for p in posts}
+            for future in as_completed(futures):
+                result = future.result()
+                with write_lock:
+                    counters["processed"] += 1
+                    if isinstance(result, Exception):
+                        counters["skipped"] += 1
+                    else:
+                        for r in result:
+                            out_f.write(json.dumps(r) + "\n")
+                        counters["games"] += len(result)
+
+                    if counters["processed"] % PROGRESS_EVERY == 0:
+                        pct = counters["processed"] / len(posts) * 100
+                        print(
+                            f"  [{pct:5.1f}%] {counters['processed']:,}/{len(posts):,} posts"
+                            f"  |  {counters['games']:,} games  |  {counters['skipped']} errors"
+                        )
+
+    print(f"\n✓ Done! Posts: {counters['processed']:,} | Games: {counters['games']:,} | Skipped: {counters['skipped']:,}")
+    print(f"  Output: {output_file}")
 
 if __name__ == "__main__":
     main()
