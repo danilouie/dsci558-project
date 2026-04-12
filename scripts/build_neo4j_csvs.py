@@ -24,6 +24,23 @@ def main() -> None:
     parser.add_argument("--limit-price-files", type=int, default=None)
     parser.add_argument("--limit-reviews", type=int, default=None)
     parser.add_argument("--limit-ranks", type=int, default=None)
+    parser.add_argument(
+        "--limit-bgg-batch-files",
+        type=int,
+        default=None,
+        help="Cap JSONL files scanned under game_review_batches/ (dev/smoke).",
+    )
+    parser.add_argument(
+        "--only-collection-user",
+        default=None,
+        help="If set, only load user/{username}_collection.jsonl. Default: all user/*_collection.jsonl files.",
+    )
+    parser.add_argument(
+        "--limit-user-collection-files",
+        type=int,
+        default=None,
+        help="Cap how many user/*_collection.jsonl files are scanned (dev/smoke).",
+    )
     parser.add_argument("--no-fuzzy-reviews", action="store_true", default=False)
     parser.add_argument("--review-min-score", type=int, default=92)
     args = parser.parse_args()
@@ -34,8 +51,11 @@ def main() -> None:
         limit_price_files=args.limit_price_files,
         limit_reviews=args.limit_reviews,
         limit_ranks=args.limit_ranks,
+        limit_bgg_batch_files=args.limit_bgg_batch_files,
+        limit_user_collection_files=args.limit_user_collection_files,
         enable_review_fuzzy_match=(not args.no_fuzzy_reviews),
         review_match_min_score=args.review_min_score,
+        only_collection_username=args.only_collection_user,
     )
 
     counts = export_all(paths, cfg)

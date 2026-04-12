@@ -11,9 +11,17 @@ services:
       - NEO4J_server_memory_pagecache_size=2G
       - NEO4J_server_memory_heap_initial__size=2G
       - NEO4J_server_memory_heap_max__size=4G
-      - NEO4J_dbms_memory_transaction_total_max=3G
-      # Keep tx timeout generous during long import batches
-      - NEO4J_dbms_transaction_timeout=30m
+      # Neo4j 5.x: use db.* keys (dbms.* names are ignored / deprecated in Docker ref).
+      # 0 = unlimited cap for the transaction-memory *estimator* pool. Large LOAD CSV plans are
+      # often over-estimated and abort with "memory pool limit exceeded" while heap is fine.
+      # For production, set an explicit cap (e.g. 6G) instead of 0.
+      - NEO4J_db_memory_transaction_total_max=0
+      # Per-transaction cap; 0 = largest allowed (see ops manual).
+      - NEO4J_db_memory_transaction_max=0
+      # Bulk LOAD CSV + IN TRANSACTIONS — default tx timeout otherwise can abort mid-import.
+      - NEO4J_db_transaction_timeout=4h
+      # Avoid false "no more locks" under heavy MERGE when another tx holds nodes briefly.
+      - NEO4J_db_lock_acquisition_timeout=10m
     volumes:
       - ./data:/data
       - ./logs:/logs
