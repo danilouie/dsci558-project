@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,6 +20,7 @@ from .util import (
     parse_int,
     tsv_iter,
     write_csv,
+    write_tsv_neo4j,
 )
 
 
@@ -30,10 +32,15 @@ class ExportConfig:
     limit_price_files: Optional[int] = None
     limit_reviews: Optional[int] = None
     limit_ranks: Optional[int] = None
+    limit_bgg_batch_files: Optional[int] = None
+    limit_user_collection_files: Optional[int] = None
 
     # Review linking strategy
     enable_review_fuzzy_match: bool = True
     review_match_min_score: int = 92  # 0..100; 92 is conservative to avoid bad links
+
+    # BGG collection: all `user/*_collection.jsonl` by default; owner = filename prefix before `_collection.jsonl`
+    only_collection_username: Optional[str] = None  # if set, only `{username}_collection.jsonl`
 
 
 def _pipe_list(v: Any) -> str:
@@ -521,6 +528,303 @@ def export_reviews(
     return review_count, edge_count
 
 
+_COLLECTION_JSONL_SUFFIX = "_collection.jsonl"
+
+
+def _user_collection_files(paths: ProjectPaths, cfg: ExportConfig) -> list[tuple[Path, str]]:
+    """
+    Returns (path, bgg_username) for each collection export file.
+    Username is the filename without `_collection.jsonl` (e.g. zrc26_collection.jsonl -> zrc26).
+    """
+    udir = paths.user_dir
+    if not udir.is_dir():
+        return []
+    if cfg.only_collection_username:
+        uname = cfg.only_collection_username.strip()
+        if not uname:
+            return []
+        p = udir / f"{uname}{_COLLECTION_JSONL_SUFFIX}"
+        return [(p, uname)] if p.is_file() else []
+    files = sorted(udir.glob(f"*{_COLLECTION_JSONL_SUFFIX}"))
+    if cfg.limit_user_collection_files is not None:
+        files = files[: cfg.limit_user_collection_files]
+    out: list[tuple[Path, str]] = []
+    for p in files:
+        if not p.is_file() or not p.name.endswith(_COLLECTION_JSONL_SUFFIX):
+            continue
+        owner = p.name[: -len(_COLLECTION_JSONL_SUFFIX)]
+        if owner:
+            out.append((p, owner))
+    return out
+
+
+def _bgg_review_stable_id(bgg_id: str, username: str, comment_trimmed: str) -> str:
+    payload = f"{bgg_id}\n{username}\n{comment_trimmed}".encode("utf-8")
+    return "bggrev:" + hashlib.sha256(payload).hexdigest()
+
+
+@dataclass
+class _BggReviewAgg:
+    bgg_id: str
+    username: str
+    comment_text: str
+    ratings: list[float]
+    sources: set[str]
+    review_keys: set[str]
+    pages: list[int]
+    game_name_raw: str
+
+
+def export_bgg_reviews_and_collection(
+    paths: ProjectPaths,
+    cfg: ExportConfig,
+    valid_bgg_ids: set[str],
+) -> dict[str, int]:
+    """
+    BGG batch JSONL + collection public comments -> deduped BggReview CSVs.
+    Collection flags -> User-Game relationship CSVs (OWNS, WANTS*, with metadata).
+    """
+    out = cfg.out_dir
+    # (bgg_id, username, comment_trimmed) -> agg
+    by_key: dict[tuple[str, str, str], _BggReviewAgg] = {}
+
+    def add_batch_line(
+        bgg_id: str,
+        username: str,
+        comment_raw: str,
+        rating: Optional[float],
+        review_key: str,
+        page: Optional[int],
+        game_name_raw: str,
+        source_tag: str,
+    ) -> None:
+        comment_trimmed = (comment_raw or "").strip()
+        if not comment_trimmed or not bgg_id or not username:
+            return
+        if bgg_id not in valid_bgg_ids:
+            return
+        key = (bgg_id, username, comment_trimmed)
+        if key not in by_key:
+            by_key[key] = _BggReviewAgg(
+                bgg_id=bgg_id,
+                username=username,
+                comment_text=comment_trimmed,
+                ratings=[],
+                sources=set(),
+                review_keys=set(),
+                pages=[],
+                game_name_raw=game_name_raw,
+            )
+        agg = by_key[key]
+        agg.sources.add(source_tag)
+        if review_key:
+            agg.review_keys.add(review_key)
+        if page is not None:
+            agg.pages.append(page)
+        if rating is not None:
+            agg.ratings.append(rating)
+        if game_name_raw and not agg.game_name_raw:
+            agg.game_name_raw = game_name_raw
+
+    batches_dir = paths.game_review_batches_dir
+    if batches_dir.is_dir():
+        jsonl_files = sorted(batches_dir.glob("**/page_*.jsonl"))
+        if cfg.limit_bgg_batch_files is not None:
+            jsonl_files = jsonl_files[: cfg.limit_bgg_batch_files]
+        for jpath in jsonl_files:
+            try:
+                for obj in jsonl_iter(jpath):
+                    bgg_id = str(obj.get("bgg_id", "")).strip()
+                    username = str(obj.get("username", "")).strip()
+                    comment_raw = str(obj.get("comment_text", ""))
+                    rk = str(obj.get("review_key", "")).strip()
+                    page = parse_int(obj.get("page"))
+                    game_name = str(obj.get("game_name", "")).strip()
+                    rating = parse_float(obj.get("rating"))
+                    add_batch_line(
+                        bgg_id,
+                        username,
+                        comment_raw,
+                        rating,
+                        rk,
+                        page,
+                        game_name,
+                        "game_review_batches",
+                    )
+            except Exception:
+                continue
+
+    collection_files = _user_collection_files(paths, cfg)
+    for coll_path, owner in collection_files:
+        for obj in jsonl_iter(coll_path):
+            bgg_id = str(obj.get("bgg_id", "")).strip()
+            comment_raw = str(obj.get("comment") or "")
+            if not bgg_id or bgg_id not in valid_bgg_ids:
+                continue
+            game_name = str(obj.get("name", "")).strip()
+            add_batch_line(
+                bgg_id,
+                owner,
+                comment_raw,
+                None,
+                "",
+                None,
+                game_name,
+                "collection",
+            )
+
+    bgg_review_fields = [
+        "bgg_review_id",
+        "comment_text",
+        "rating",
+        "username",
+        "sources",
+        "source_review_keys",
+        "page",
+        "game_name_raw",
+    ]
+    game_edge_fields = ["bgg_id", "bgg_review_id"]
+    user_edge_fields = ["username", "bgg_review_id"]
+
+    def review_rows() -> Iterable[dict[str, Any]]:
+        for agg in by_key.values():
+            bid = _bgg_review_stable_id(agg.bgg_id, agg.username, agg.comment_text)
+            max_rating = ""
+            if agg.ratings:
+                max_rating = max(agg.ratings)
+            page_v = ""
+            if agg.pages:
+                page_v = min(agg.pages)
+            yield {
+                "bgg_review_id": bid,
+                "comment_text": agg.comment_text,
+                "rating": max_rating,
+                "username": agg.username,
+                "sources": "|".join(sorted(agg.sources)),
+                "source_review_keys": "|".join(sorted(agg.review_keys)),
+                "page": page_v,
+                "game_name_raw": agg.game_name_raw,
+            }
+
+    def game_edge_rows() -> Iterable[dict[str, Any]]:
+        for agg in by_key.values():
+            bid = _bgg_review_stable_id(agg.bgg_id, agg.username, agg.comment_text)
+            yield {"bgg_id": agg.bgg_id, "bgg_review_id": bid}
+
+    def user_edge_rows() -> Iterable[dict[str, Any]]:
+        for agg in by_key.values():
+            bid = _bgg_review_stable_id(agg.bgg_id, agg.username, agg.comment_text)
+            yield {"username": agg.username, "bgg_review_id": bid}
+
+    meta_cols = ["owner_username", "bgg_id", "collid", "num_plays", "last_modified", "name"]
+
+    def empty_meta_row(o: str, g: str) -> dict[str, Any]:
+        return {
+            "owner_username": o,
+            "bgg_id": g,
+            "collid": "",
+            "num_plays": "",
+            "last_modified": "",
+            "name": "",
+        }
+
+    def full_meta_row(
+        o: str,
+        g: str,
+        collid: str,
+        num_plays: Optional[int],
+        last_modified: str,
+        name: str,
+    ) -> dict[str, Any]:
+        return {
+            "owner_username": o,
+            "bgg_id": g,
+            "collid": collid,
+            "num_plays": num_plays if num_plays is not None else "",
+            "last_modified": last_modified,
+            "name": name,
+        }
+
+    owns_rows: list[dict[str, Any]] = []
+    wants_rows: list[dict[str, Any]] = []
+    wtb_rows: list[dict[str, Any]] = []
+    wtt_rows: list[dict[str, Any]] = []
+
+    for coll_path, owner in collection_files:
+        for obj in jsonl_iter(coll_path):
+            bgg_id = str(obj.get("bgg_id", "")).strip()
+            if not bgg_id or bgg_id not in valid_bgg_ids:
+                continue
+            own = parse_bool(obj.get("own"))
+            want = parse_bool(obj.get("want"))
+            wtb = parse_bool(obj.get("want_to_buy"))
+            ft = parse_bool(obj.get("for_trade"))
+            collid = str(obj.get("collid", "") or "").strip()
+            num_plays = parse_int(obj.get("num_plays"))
+            last_modified = str(obj.get("last_modified") or "").strip()
+            name = str(obj.get("name", "") or "").strip()
+            full = full_meta_row(owner, bgg_id, collid, num_plays, last_modified, name)
+
+            if own is True:
+                owns_rows.append(full)
+            if not own:
+                if want is True:
+                    carrier = "WANTS"
+                elif wtb is True:
+                    carrier = "WANTS_TO_BUY"
+                elif ft is True:
+                    carrier = "WANTS_TO_TRADE"
+                else:
+                    carrier = ""
+            else:
+                carrier = ""
+
+            def meta_for(rel: str) -> dict[str, Any]:
+                if own is True:
+                    return empty_meta_row(owner, bgg_id)
+                if rel == carrier:
+                    return full
+                return empty_meta_row(owner, bgg_id)
+
+            if want is True:
+                wants_rows.append(meta_for("WANTS"))
+            if wtb is True:
+                wtb_rows.append(meta_for("WANTS_TO_BUY"))
+            if ft is True:
+                wtt_rows.append(meta_for("WANTS_TO_TRADE"))
+
+    usernames: set[str] = {o for _, o in collection_files}
+    for agg in by_key.values():
+        if agg.username:
+            usernames.add(agg.username)
+
+    users_count = write_csv(
+        out / "users.csv",
+        ["username"],
+        ({"username": u} for u in sorted(usernames)),
+    )
+    # TSV: free-text comments often contain commas; Neo4j's CSV parser is strict on quoted commas.
+    br_count = write_tsv_neo4j(out / "bgg_reviews.tsv", bgg_review_fields, review_rows())
+    ge_count = write_csv(out / "game_bgg_review_edges.csv", game_edge_fields, game_edge_rows())
+    ue_count = write_csv(out / "user_bgg_review_edges.csv", user_edge_fields, user_edge_rows())
+    o_count = write_csv(out / "user_game_owns.csv", meta_cols, owns_rows)
+    w_count = write_csv(out / "user_game_wants.csv", meta_cols, wants_rows)
+    wtb_c = write_csv(out / "user_game_wants_to_buy.csv", meta_cols, wtb_rows)
+    wtt_c = write_csv(out / "user_game_wants_to_trade.csv", meta_cols, wtt_rows)
+
+    return {
+        "user_collection_files": len(collection_files),
+        "users": users_count,
+        "bgg_reviews": br_count,
+        "game_bgg_review_edges": ge_count,
+        "user_bgg_review_edges": ue_count,
+        "user_game_owns": o_count,
+        "user_game_wants": w_count,
+        "user_game_wants_to_buy": wtb_c,
+        "user_game_wants_to_trade": wtt_c,
+    }
+
+
 def export_all(paths: ProjectPaths, cfg: ExportConfig) -> dict[str, int]:
     ensure_dir(cfg.out_dir)
 
@@ -539,7 +843,10 @@ def export_all(paths: ProjectPaths, cfg: ExportConfig) -> dict[str, int]:
     price_points_count = export_price_points(paths, cfg, bgg_id_by_bgo_key=bgg_id_by_bgo_key)
     reviews_count, review_edges_count = export_reviews(paths, cfg, name_by_bgg_id=name_by_bgg_id)
 
-    return {
+    valid_bgg_ids = set(name_by_bgg_id.keys())
+    bgg_counts = export_bgg_reviews_and_collection(paths, cfg, valid_bgg_ids=valid_bgg_ids)
+
+    out = {
         "games": games_count,
         "bgo_keys": mapping_count,
         "ranks": ranks_count,
@@ -547,4 +854,6 @@ def export_all(paths: ProjectPaths, cfg: ExportConfig) -> dict[str, int]:
         "reviews": reviews_count,
         "review_edges": review_edges_count,
     }
+    out.update(bgg_counts)
+    return out
 

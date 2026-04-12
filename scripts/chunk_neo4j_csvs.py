@@ -46,7 +46,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Split large Neo4j import CSV files into chunks.")
     parser.add_argument("--import-dir", default="neo4j/import", help="Input import directory")
     parser.add_argument("--out-dir", default="neo4j/import/chunks", help="Output chunks directory")
-    parser.add_argument("--rows", type=int, default=500_000, help="Rows per chunk")
+    # Smaller chunks keep LOAD CSV + IN TRANSACTIONS under Neo4j 5's transaction-memory estimator.
+    parser.add_argument("--rows", type=int, default=100_000, help="Rows per chunk")
     args = parser.parse_args()
 
     import_dir = Path(args.import_dir)

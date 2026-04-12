@@ -90,25 +90,87 @@ def csv_iter(path: Path) -> Iterable[dict[str, str]]:
             yield {k: (v if v is not None else "") for k, v in row.items()}
 
 
+# Curly/smart quotes and similar must not remain as U+201C/U+201D — Neo4j LOAD CSV treats ASCII " as special.
+_NEO4J_CSV_QUOTE_TRANSLATE = str.maketrans(
+    {
+        "\u201c": "'",  # "
+        "\u201d": "'",  # "
+        "\u201e": "'",  # „
+        "\u201f": "'",  # ‟
+        "\u00ab": "'",  # «
+        "\u00bb": "'",  # »
+        "\u2033": "'",  # ″
+        "\u2036": "'",  # ‶
+        "\uff02": "'",  # FULLWIDTH QUOTATION MARK
+        "\u275d": "'",  # HEAVY DOUBLE COMMA QUOTATION MARK ORNAMENT
+        "\u275e": "'",  # HEAVY DOUBLE TURNED COMMA QUOTATION MARK ORNAMENT
+        "\u301d": "'",  # REVERSED DOUBLE PRIME QUOTATION MARK
+        "\u301e": "'",  # DOUBLE PRIME QUOTATION MARK
+        "\u301f": "'",  # LOW DOUBLE PRIME QUOTATION MARK
+    }
+)
+
+
+def neo4j_csv_cell(v: Any) -> str:
+    """
+    Normalize a cell for Neo4j LOAD CSV: no raw newlines/tabs, no ASCII or curly double-quotes,
+    no NUL, no zero-width / line-separator chars that confuse parsers. Output is always a string.
+    """
+    if v is None:
+        return ""
+    if not isinstance(v, str):
+        s = str(v)
+    else:
+        s = v
+    s = s.replace("\x00", " ").replace("\x0b", " ")
+    s = s.translate(_NEO4J_CSV_QUOTE_TRANSLATE)
+    s = s.replace('"', "'")
+    # Strip BOM / ZWSP / ZWJ etc. and Unicode line/paragraph separators (often in scraped HTML).
+    for ch in ("\ufeff", "\u200b", "\u200c", "\u200d", "\u2060"):
+        s = s.replace(ch, "")
+    s = s.replace("\u2028", " ").replace("\u2029", " ")
+    s = s.replace("\r", " ").replace("\n", " ").replace("\t", " ")
+    return " ".join(s.split())
+
+
 def write_csv(path: Path, fieldnames: list[str], rows: Iterable[dict[str, Any]]) -> int:
     ensure_dir(path.parent)
     count = 0
 
-    def clean(v: Any) -> Any:
-        if isinstance(v, str):
-            # Neo4j LOAD CSV is sensitive to malformed quoted fields.
-            # Normalize control chars/newlines and strip embedded double quotes.
-            s = v.replace("\x00", " ")
-            s = s.replace("\r", " ").replace("\n", " ").replace("\t", " ")
-            s = s.replace('"', "'")
-            return " ".join(s.split())
-        return v
-
     with path.open("w", encoding="utf-8", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        writer = csv.DictWriter(
+            f,
+            fieldnames=fieldnames,
+            extrasaction="ignore",
+            quoting=csv.QUOTE_ALL,
+            doublequote=True,
+        )
         writer.writeheader()
         for row in rows:
-            writer.writerow({k: clean(row.get(k, "")) for k in fieldnames})
+            writer.writerow({k: neo4j_csv_cell(row.get(k, "")) for k in fieldnames})
+            count += 1
+    return count
+
+
+def write_tsv_neo4j(path: Path, fieldnames: list[str], rows: Iterable[dict[str, Any]]) -> int:
+    """
+    Tab-separated export for Neo4j LOAD CSV with FIELDTERMINATOR '\\t'.
+    Avoids comma/quote ambiguity in long free-text fields (e.g. BGG comments).
+    """
+    ensure_dir(path.parent)
+    count = 0
+    with path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=fieldnames,
+            extrasaction="ignore",
+            delimiter="\t",
+            quoting=csv.QUOTE_MINIMAL,
+            doublequote=True,
+        )
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({k: neo4j_csv_cell(row.get(k, "")) for k in fieldnames})
             count += 1
     return count
 

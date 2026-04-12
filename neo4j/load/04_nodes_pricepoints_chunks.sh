@@ -1,10 +1,15 @@
 #!/usr/bin/env bash
+# PricePoint MERGE touches many numeric properties; Neo4j 5 transaction-memory estimates for
+# large CSVs can exceed pool limits. Fix: smaller files (chunk_neo4j_csvs.py), docker
+# db.memory.transaction.*.max=0, and optional PRICEPOINT_TXN_ROWS (default 5) / PRICEPOINT_REL_TXN_ROWS (default 50).
 set -euo pipefail
 
 CONTAINER="${1:-dsci558-neo4j}"
 AUTH_USER="${NEO4J_USER:-neo4j}"
 AUTH_PASS="${NEO4J_PASSWORD:-password}"
 CHUNKS_DIR="${2:-neo4j/import/chunks}"
+TXN="${PRICEPOINT_TXN_ROWS:-5}"
+REL_TXN="${PRICEPOINT_REL_TXN_ROWS:-50}"
 
 for file in "${CHUNKS_DIR}"/price_points_*.csv; do
   [ -e "$file" ] || { echo "No price_points chunk files found in ${CHUNKS_DIR}"; exit 1; }
@@ -27,7 +32,7 @@ CALL {
     p.mean_price = CASE WHEN row.mean_price = '' THEN null ELSE toFloat(row.mean_price) END,
     p.max_price = CASE WHEN row.max_price = '' THEN null ELSE toFloat(row.max_price) END,
     p.source = row.source
-} IN TRANSACTIONS OF 5 ROWS;
+} IN TRANSACTIONS OF ${TXN} ROWS;
 EOF
   docker exec -i "${CONTAINER}" cypher-shell -u "${AUTH_USER}" -p "${AUTH_PASS}" <<EOF
 CALL {
@@ -35,7 +40,7 @@ CALL {
   MATCH (g:Game {bgg_id: row.bgg_id})
   MATCH (p:PricePoint {price_point_id: row.price_point_id})
   MERGE (g)-[:HAS_PRICE_POINT]->(p)
-} IN TRANSACTIONS OF 100 ROWS;
+} IN TRANSACTIONS OF ${REL_TXN} ROWS;
 EOF
 done
 
