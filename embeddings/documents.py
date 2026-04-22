@@ -39,7 +39,8 @@ class EmbeddingDocument:
 
 
 def _sort_tuple(d: EmbeddingDocument) -> tuple[int, str]:
-    return (_DOC_KIND_ORDER[d.doc_kind], d.sort_key)
+    order = _DOC_KIND_ORDER.get(d.doc_kind, len(_DOC_KIND_ORDER))
+    return (order, d.sort_key)
 
 
 def sort_documents(rows: list[EmbeddingDocument]) -> list[EmbeddingDocument]:

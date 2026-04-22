@@ -18,7 +18,7 @@ from embeddings.checkpoint import (
     save_checkpoint,
     write_manifest,
 )
-from embeddings.documents import EmbeddingDocument, collect_all_documents
+from embeddings.documents import EmbeddingDocument, collect_all_documents, sort_documents
 from embeddings.layout import ArtifactPaths, EmbeddingMeta
 from numpy.lib.format import open_memmap
 
@@ -283,12 +283,18 @@ def build_faiss_index(
     include_bgq: bool = True,
     include_bgg_reviews: bool = True,
     only_bgg_ids: frozenset[str] | None = None,
+    documents: list[EmbeddingDocument] | None = None,
     show_progress: bool = True,
     quiet: bool = False,
     resume: bool = False,
     encoder_device: str | None = None,
+    encoder_model: object | None = None,
 ) -> EmbeddingMeta:
     enc_dev = _encoder_device(encoder_device)
+    if documents is not None and resume:
+        raise ValueError("explicit documents list cannot be combined with resume")
+    if encoder_model is not None and resume:
+        raise ValueError("encoder_model cannot be combined with resume")
     if resume and skip_vectors_npy:
         raise ValueError("--resume requires writing vectors.npy (do not pass --no-vectors-npy).")
 
@@ -304,31 +310,47 @@ def build_faiss_index(
     artifacts.ensure_dirs()
     neo_resolved = str(neo4j_import.resolve())
 
-    if not quiet:
-        print("Collecting documents from neo4j/import CSVs (can take a while with BGG chunks)...", flush=True)
+    if documents is not None:
+        docs = sort_documents(documents)
+        if not docs:
+            raise RuntimeError("explicit documents list is empty")
+        if not quiet:
+            print(f"Using {len(docs)} explicit documents (no CSV collect).", flush=True)
+    else:
+        if not quiet:
+            print(
+                "Collecting documents from neo4j/import CSVs (can take a while with BGG chunks)...",
+                flush=True,
+            )
 
-    docs = collect_all_documents(
-        neo4j_import,
-        limit=limit_documents,
-        include_games=include_games,
-        include_bgq=include_bgq,
-        include_bgg_reviews=include_bgg_reviews,
-        only_bgg_ids=only_bgg_ids,
-    )
-    if not docs:
-        raise RuntimeError(
-            f"No embeddable documents found under {neo4j_import}. "
-            "Expected games.csv, reviews.csv, and/or bgg_reviews.tsv."
+        docs = collect_all_documents(
+            neo4j_import,
+            limit=limit_documents,
+            include_games=include_games,
+            include_bgq=include_bgq,
+            include_bgg_reviews=include_bgg_reviews,
+            only_bgg_ids=only_bgg_ids,
         )
+        if not docs:
+            raise RuntimeError(
+                f"No embeddable documents found under {neo4j_import}. "
+                "Expected games.csv, reviews.csv, and/or bgg_reviews.tsv."
+            )
 
     fingerprint = fingerprint_documents(docs)
     n = len(docs)
 
     if not quiet:
         print(f"Collected {n} documents.", flush=True)
-        print(f"Loading embedding model {model_name!r}...", flush=True)
 
-    model = SentenceTransformer(model_name, device=enc_dev)
+    if encoder_model is not None:
+        model = encoder_model
+        if not quiet:
+            print(f"Using provided embedding model ({model_name!r}).", flush=True)
+    else:
+        if not quiet:
+            print(f"Loading embedding model {model_name!r}...", flush=True)
+        model = SentenceTransformer(model_name, device=enc_dev)
     dim = (
         model.get_embedding_dimension()
         if hasattr(model, "get_embedding_dimension")
