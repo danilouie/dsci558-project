@@ -1,4 +1,3 @@
-# extract_games.py
 import json
 import re
 import sys
@@ -25,10 +24,10 @@ Return ONLY valid JSON, no explanation:
 If no games are recommended, return: {"games": []}
 Only include games that are clearly being recommended, praised, suggested, or compared."""
 
-# --- Tunables ---
-MAX_WORKERS    = 8     # Parallel Ollama calls; raise if your machine handles it
-TEXT_LIMIT     = 1000  # Characters sent to the model per post
-PROGRESS_EVERY = 500   # Print progress every N posts
+
+MAX_WORKERS    = 8     
+TEXT_LIMIT     = 1000  
+PROGRESS_EVERY = 500   
 
 
 def extract_games(post: dict) -> list[dict]:
