@@ -44,6 +44,9 @@ NEO4J_DATABASE=neo4j
 NEO4J_AUTH_MODE=basic
 NEO4J_USER=neo4j
 NEO4J_PASSWORD=password
+
+# Optional: set to false to silence step-by-step request/search logs in the backend console
+# TRACE_STEPS=false
 ```
 
 ## 3) Run the App

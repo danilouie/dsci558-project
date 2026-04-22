@@ -756,6 +756,45 @@ button {
   }
 }
 
+.preset-chips {
+  grid-column: 1 / -1;
+  margin: 0.25rem 0 0.5rem;
+}
+
+.chips-label {
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-muted, #7a7a8c);
+  margin: 0 0 0.35rem;
+}
+
+.chip-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+}
+
+.preset-chip {
+  font-size: 0.75rem;
+  padding: 0.25rem 0.5rem;
+  border-radius: 999px;
+  border: 1px solid var(--border-subtle, rgba(255, 255, 255, 0.12));
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  line-height: 1.2;
+}
+
+.preset-chip:hover {
+  border-color: var(--accent, #6b8cff);
+}
+
+.preset-chip.active {
+  background: color-mix(in srgb, var(--accent, #6b8cff) 25%, transparent);
+  border-color: var(--accent, #6b8cff);
+}
+
 @keyframes node-bob {
   0%,
   100% {

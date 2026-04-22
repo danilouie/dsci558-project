@@ -5,7 +5,10 @@ import type {
   GraphApiResponse,
   GraphNode,
   GraphPayload,
-  RecommendRequestBody
+  QueryPresetId,
+  RecommendRequestBody,
+  SearchMeta,
+  SearchSortField
 } from "../../shared/contracts";
 
 const API_URL = import.meta.env.VITE_API_URL || "http://localhost:4000";
@@ -14,6 +17,10 @@ interface RecommendFilters {
   keyword: string;
   players: string;
   maxTime: string;
+  maxPrice: string;
+  minRating: string;
+  preset: string;
+  sort: SearchSortField | "";
 }
 
 interface Position {
@@ -32,6 +39,19 @@ interface LayoutNode extends Position {
 
 function getCenterNode(graph: GraphPayload): GraphNode | null {
   return graph.nodes.find((node) => node.kind === "center") || graph.nodes[0] || null;
+}
+
+function applySearchMetaToGraph(graph: GraphPayload, searchMeta: SearchMeta | null | undefined): GraphPayload {
+  if (!searchMeta?.topHit) return graph;
+  const { game, explain } = searchMeta.topHit;
+  return {
+    ...graph,
+    nodes: graph.nodes.map((n) =>
+        n.id === game.id && n.kind === "center"
+        ? { ...n, ...game, searchExplain: explain }
+        : n
+    )
+  };
 }
 
 const demoCatalog: Array<Pick<GameSummary, "id" | "name" | "rating" | "usersRated">> = [
@@ -74,14 +94,46 @@ function buildDemoGraph(centerId = demoCatalog[0].id): GraphPayload {
 const defaultFilters: RecommendFilters = {
   keyword: "",
   players: "",
-  maxTime: ""
+  maxTime: "",
+  maxPrice: "",
+  minRating: "",
+  preset: "",
+  sort: ""
 };
+
+const PRESET_CHIPS: { id: QueryPresetId; label: string }[] = [
+  { id: "best_under_budget", label: "Best under $30" },
+  { id: "value_for_price", label: "Value for price" },
+  { id: "highly_rated_cheap", label: "Highly rated + cheap" },
+  { id: "undervalued", label: "Undervalued" },
+  { id: "overpriced", label: "Overpriced" },
+  { id: "high_want_low_own", label: "High want, low own" },
+  { id: "frequently_traded", label: "Frequently traded" },
+  { id: "rating_per_dollar", label: "Rating / $ " },
+  { id: "composite_demo", label: "Smart demo" }
+];
+
+const SORT_OPTIONS: { value: SearchSortField; label: string }[] = [
+  { value: "rating", label: "Geek rating" },
+  { value: "mean_price", label: "Price (latest mean)" },
+  { value: "rating_per_dollar", label: "Rating per $" },
+  { value: "rank_value_asc", label: "BGG rank" },
+  { value: "want_minus_own", label: "Wants minus owns" },
+  { value: "wtt", label: "Want-to-trade count" },
+  { value: "wants", label: "Want count" },
+  { value: "value_score", label: "Value score (on graph)" },
+  { value: "price_drop", label: "Price drop vs window" }
+];
 
 function toRequestFilters(filters: RecommendFilters): RecommendRequestBody["filters"] {
   return {
-    keyword: filters.keyword,
+    keyword: filters.keyword || undefined,
     players: filters.players ? Number(filters.players) : null,
-    maxTime: filters.maxTime ? Number(filters.maxTime) : null
+    maxTime: filters.maxTime ? Number(filters.maxTime) : null,
+    maxPrice: filters.maxPrice ? Number(filters.maxPrice) : null,
+    minRating: filters.minRating ? Number(filters.minRating) : null,
+    preset: (filters.preset as QueryPresetId) || null,
+    sort: filters.sort || undefined
   };
 }
 
@@ -547,9 +599,10 @@ function App() {
       }
 
       const payload = (await response.json()) as GraphApiResponse;
-      setGraph(payload.graph);
-      setActiveNodeId(payload.graph.centerId);
-      setSelectedGame(getCenterNode(payload.graph));
+      const nextGraph = applySearchMetaToGraph(payload.graph, payload.searchMeta ?? null);
+      setGraph(nextGraph);
+      setActiveNodeId(nextGraph.centerId);
+      setSelectedGame(getCenterNode(nextGraph));
       setStatus(note);
     } catch (requestError) {
       setError(requestError instanceof Error ? requestError.message : "Recommendation failed.");
@@ -679,6 +732,39 @@ function App() {
                   </article>
                 </div>
 
+                {selectedGame.searchExplain ? (
+                  <div className="info-stat-grid">
+                    <article>
+                      <span>Est. price</span>
+                      <strong>
+                        {selectedGame.searchExplain.meanPrice == null
+                          ? "—"
+                          : `$${selectedGame.searchExplain.meanPrice.toFixed(2)}`}
+                      </strong>
+                    </article>
+                    <article>
+                      <span>$/rating</span>
+                      <strong>
+                        {selectedGame.searchExplain.ratingPerDollar == null
+                          ? "—"
+                          : selectedGame.searchExplain.ratingPerDollar.toFixed(3)}
+                      </strong>
+                    </article>
+                    <article>
+                      <span>Wants / owns</span>
+                      <strong>
+                        {selectedGame.searchExplain.wants} / {selectedGame.searchExplain.owns}
+                      </strong>
+                    </article>
+                    <article>
+                      <span>WTB / WTT</span>
+                      <strong>
+                        {selectedGame.searchExplain.wtb} / {selectedGame.searchExplain.wtt}
+                      </strong>
+                    </article>
+                  </div>
+                ) : null}
+
                 <div className="info-section">
                   <h3>Details</h3>
                   <p>
@@ -778,7 +864,7 @@ function App() {
               />
             </label>
             <label>
-              Max time
+              Max time (min)
               <input
                 value={filters.maxTime}
                 onChange={(event) => setFilters((current) => ({ ...current, maxTime: event.target.value }))}
@@ -786,6 +872,60 @@ function App() {
                 placeholder="90"
               />
             </label>
+            <label>
+              Max price ($)
+              <input
+                value={filters.maxPrice}
+                onChange={(event) => setFilters((current) => ({ ...current, maxPrice: event.target.value }))}
+                inputMode="decimal"
+                placeholder="30"
+              />
+            </label>
+            <label>
+              Min rating
+              <input
+                value={filters.minRating}
+                onChange={(event) => setFilters((current) => ({ ...current, minRating: event.target.value }))}
+                inputMode="decimal"
+                placeholder="7.0"
+              />
+            </label>
+            <label>
+              Sort by
+              <select
+                value={filters.sort}
+                onChange={(event) =>
+                  setFilters((current) => ({ ...current, sort: event.target.value as SearchSortField | "" }))
+                }
+              >
+                <option value="">Default</option>
+                {SORT_OPTIONS.map((o) => (
+                  <option key={o.value} value={o.value}>
+                    {o.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <div className="preset-chips">
+              <p className="chips-label">Presets</p>
+              <div className="chip-row">
+                {PRESET_CHIPS.map((c) => (
+                  <button
+                    key={c.id}
+                    type="button"
+                    className={`preset-chip ${filters.preset === c.id ? "active" : ""}`}
+                    onClick={() =>
+                      setFilters((cur) => ({
+                        ...cur,
+                        preset: cur.preset === c.id ? "" : c.id
+                      }))
+                    }
+                  >
+                    {c.label}
+                  </button>
+                ))}
+              </div>
+            </div>
             <button type="submit">Recommend from filters</button>
           </form>
 
