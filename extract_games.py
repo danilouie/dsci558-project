@@ -17,17 +17,32 @@ Return ONLY valid JSON, no explanation:
       "title": "exact game title as mentioned",
       "recommendation_type": "suggestion | opinion | comparison",
       "sentiment": "positive | negative | neutral",
+            "quality_score": "integer from 1 to 10 for how good the game is in this post's context",
       "evidence": "brief quote or paraphrase showing the recommendation"
     }
   ]
 }
 If no games are recommended, return: {"games": []}
-Only include games that are clearly being recommended, praised, suggested, or compared."""
+Only include games that are clearly being recommended, praised, suggested, or compared.
+
+Scoring rules for quality_score:
+- Use post context + sentiment, not external knowledge.
+- 9-10: very strong praise/recommendation.
+- 7-8: clearly favorable.
+- 5-6: mixed/uncertain or weakly positive.
+- 3-4: mostly negative.
+- 1-2: strongly negative."""
+
+# --- Tunables ---
+MAX_WORKERS    = 8     # Parallel Ollama calls; raise if your machine handles it
+TEXT_LIMIT     = 1000  # Characters sent to the model per post
+PROGRESS_EVERY = 500   # Print progress every N posts
 
 
-MAX_WORKERS    = 8     
-TEXT_LIMIT     = 1000  
-PROGRESS_EVERY = 500   
+def score_from_sentiment(sentiment: str) -> int:
+    """Fallback score when model output is missing/invalid."""
+    mapping = {"positive": 8, "neutral": 5, "negative": 2}
+    return mapping.get((sentiment or "").strip().lower(), 5)
 
 
 def extract_games(post: dict) -> list[dict]:
@@ -56,7 +71,14 @@ def extract_games(post: dict) -> list[dict]:
             "response_author":     post["metadata"]["response_author"],
             "game_title":          g["title"],
             "recommendation_type": g["recommendation_type"],
-            "sentiment":           g["sentiment"],
+            "sentiment":           g.get("sentiment", "neutral"),
+            "quality_score":       min(
+                10,
+                max(
+                    1,
+                    int(g.get("quality_score", score_from_sentiment(g.get("sentiment", "neutral"))))
+                )
+            ),
             "evidence":            g["evidence"],
         }
         for g in games
