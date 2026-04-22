@@ -33,11 +33,9 @@ Scoring rules for quality_score:
 - 3-4: mostly negative.
 - 1-2: strongly negative."""
 
-# --- Tunables ---
-MAX_WORKERS    = 8     # Parallel Ollama calls; raise if your machine handles it
-TEXT_LIMIT     = 1000  # Characters sent to the model per post
-PROGRESS_EVERY = 500   # Print progress every N posts
-
+MAX_WORKERS    = 8     
+TEXT_LIMIT     = 1000  
+PROGRESS_EVERY = 500   
 
 def score_from_sentiment(sentiment: str) -> int:
     """Fallback score when model output is missing/invalid."""
