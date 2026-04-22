@@ -41,8 +41,12 @@ def main() -> None:
         default=None,
         help="Cap how many user/*_collection.jsonl files are scanned (dev/smoke).",
     )
-    parser.add_argument("--no-fuzzy-reviews", action="store_true", default=False)
-    parser.add_argument("--review-min-score", type=int, default=92)
+    parser.add_argument(
+        "--overlap-only",
+        action="store_true",
+        default=False,
+        help="Only export games whose bgg_id appears in bgo_key_bgg_map.tsv (BGO↔BGG overlap).",
+    )
     args = parser.parse_args()
 
     cfg = ExportConfig(
@@ -53,9 +57,8 @@ def main() -> None:
         limit_ranks=args.limit_ranks,
         limit_bgg_batch_files=args.limit_bgg_batch_files,
         limit_user_collection_files=args.limit_user_collection_files,
-        enable_review_fuzzy_match=(not args.no_fuzzy_reviews),
-        review_match_min_score=args.review_min_score,
         only_collection_username=args.only_collection_user,
+        overlap_only=args.overlap_only,
     )
 
     counts = export_all(paths, cfg)

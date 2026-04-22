@@ -6,8 +6,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
-from rapidfuzz import fuzz, process
-
 from .paths import ProjectPaths
 from .util import (
     csv_iter,
@@ -35,12 +33,22 @@ class ExportConfig:
     limit_bgg_batch_files: Optional[int] = None
     limit_user_collection_files: Optional[int] = None
 
-    # Review linking strategy
-    enable_review_fuzzy_match: bool = True
-    review_match_min_score: int = 92  # 0..100; 92 is conservative to avoid bad links
-
     # BGG collection: all `user/*_collection.jsonl` by default; owner = filename prefix before `_collection.jsonl`
     only_collection_username: Optional[str] = None  # if set, only `{username}_collection.jsonl`
+
+    # If True, only games in bgo_key_bgg_map.tsv (non-empty key + bgg_id) are exported.
+    overlap_only: bool = False
+
+
+def load_overlap_bgg_ids(paths: ProjectPaths) -> set[str]:
+    """Overlap bgg_ids: mapping TSV rows with non-empty Oracle key and bgg_id."""
+    out: set[str] = set()
+    for row in tsv_iter(paths.bgo_map_tsv):
+        key = row.get("key", "").strip()
+        bgg_id = row.get("bgg_id", "").strip()
+        if key and bgg_id:
+            out.add(bgg_id)
+    return out
 
 
 def _pipe_list(v: Any) -> str:
@@ -58,7 +66,11 @@ def _pipe_list(v: Any) -> str:
     return s.replace("|", "/") if s else ""
 
 
-def export_games(paths: ProjectPaths, cfg: ExportConfig) -> tuple[int, dict[str, str]]:
+def export_games(
+    paths: ProjectPaths,
+    cfg: ExportConfig,
+    overlap_bgg_ids: Optional[set[str]] = None,
+) -> tuple[int, dict[str, str]]:
     """
     Returns (count, bgg_id->name) for later matching.
     """
@@ -105,6 +117,8 @@ def export_games(paths: ProjectPaths, cfg: ExportConfig) -> tuple[int, dict[str,
             bgg_id = str(obj.get("bgg_id", "")).strip()
             if not bgg_id:
                 continue
+            if overlap_bgg_ids is not None and bgg_id not in overlap_bgg_ids:
+                continue
             name = str(obj.get("name", "")).strip()
             if name:
                 name_by_bgg_id[bgg_id] = name
@@ -143,7 +157,11 @@ def export_games(paths: ProjectPaths, cfg: ExportConfig) -> tuple[int, dict[str,
     return count, name_by_bgg_id
 
 
-def export_mapping(paths: ProjectPaths, cfg: ExportConfig) -> int:
+def export_mapping(
+    paths: ProjectPaths,
+    cfg: ExportConfig,
+    overlap_bgg_ids: Optional[set[str]] = None,
+) -> int:
     out_path = cfg.out_dir / "bgo_keys.csv"
     fieldnames = ["key", "slug", "title", "bgg_id", "bgg_url", "detail_url"]
 
@@ -207,9 +225,13 @@ def export_mapping(paths: ProjectPaths, cfg: ExportConfig) -> int:
                 title = kn.get("name", "").strip()
                 if not key:
                     continue
+                if overlap_bgg_ids is not None and key not in mapping_by_key:
+                    continue
 
                 extra = mapping_by_key.get(key, {})
                 bgg_id = extra.get("bgg_id", "").strip() or resolve_bgg_id_from_name(title)
+                if overlap_bgg_ids is not None and (not bgg_id or bgg_id not in overlap_bgg_ids):
+                    continue
 
                 yield {
                     "key": key,
@@ -226,11 +248,14 @@ def export_mapping(paths: ProjectPaths, cfg: ExportConfig) -> int:
             key = row.get("key", "").strip()
             if not key:
                 continue
+            bgg_id = row.get("bgg_id", "").strip()
+            if overlap_bgg_ids is not None and (not bgg_id or bgg_id not in overlap_bgg_ids):
+                continue
             yield {
                 "key": key,
                 "slug": row.get("slug", ""),
                 "title": row.get("title", ""),
-                "bgg_id": row.get("bgg_id", "").strip(),
+                "bgg_id": bgg_id,
                 "bgg_url": row.get("bgg_url", ""),
                 "detail_url": row.get("detail_url", ""),
             }
@@ -238,7 +263,11 @@ def export_mapping(paths: ProjectPaths, cfg: ExportConfig) -> int:
     return write_csv(out_path, fieldnames, rows())
 
 
-def export_ranks(paths: ProjectPaths, cfg: ExportConfig) -> int:
+def export_ranks(
+    paths: ProjectPaths,
+    cfg: ExportConfig,
+    overlap_bgg_ids: Optional[set[str]] = None,
+) -> int:
     out_path = cfg.out_dir / "ranks.csv"
     # Keep compatibility columns (used by Cypher import) and also store every
     # column from `boardgames_ranks.csv`.
@@ -273,6 +302,8 @@ def export_ranks(paths: ProjectPaths, cfg: ExportConfig) -> int:
                 break
             bgg_id = row.get("id", "").strip()
             if not bgg_id:
+                continue
+            if overlap_bgg_ids is not None and bgg_id not in overlap_bgg_ids:
                 continue
             yield {
                 "rank_id": bgg_id,
@@ -397,13 +428,12 @@ def export_reviews(
     paths: ProjectPaths,
     cfg: ExportConfig,
     name_by_bgg_id: dict[str, str],
+    overlap_bgg_ids: Optional[set[str]] = None,
 ) -> tuple[int, int]:
     """
     Returns (reviews_count, review_edges_count).
 
-    Linking:
-    - Try exact match of `game_name` to `Game.name` (case-insensitive)
-    - Fallback to fuzzy match against `Game.name` if enabled.
+    Linking: case-insensitive exact match of BGQ `game_name` to `Game.name` from `name_by_bgg_id`.
     """
     out_reviews = cfg.out_dir / "reviews.csv"
     out_edges = cfg.out_dir / "game_review_edges.csv"
@@ -433,36 +463,17 @@ def export_reviews(
     ] + [k for k in bgq_keys if k not in {"url", "title", "author", "category", "score"}]
     edge_fields = ["bgg_id", "review_id"]
 
-    # Prepare match indexes
     by_lower_name: dict[str, str] = {}
-    names: list[str] = []
-    bgg_ids_for_names: list[str] = []
     for bgg_id, name in name_by_bgg_id.items():
         ln = name.strip().lower()
         if ln and ln not in by_lower_name:
             by_lower_name[ln] = bgg_id
-            names.append(name)
-            bgg_ids_for_names.append(bgg_id)
 
     def resolve_bgg_id(game_name: str) -> Optional[str]:
         ln = game_name.strip().lower()
         if not ln:
             return None
-        if ln in by_lower_name:
-            return by_lower_name[ln]
-        if not cfg.enable_review_fuzzy_match or not names:
-            return None
-        match = process.extractOne(
-            game_name,
-            names,
-            scorer=fuzz.WRatio,
-        )
-        if not match:
-            return None
-        choice, score, idx = match[0], match[1], match[2]
-        if score < cfg.review_match_min_score:
-            return None
-        return bgg_ids_for_names[idx]
+        return by_lower_name.get(ln)
 
     import csv
 
@@ -490,6 +501,8 @@ def export_reviews(
             game_name = str(obj.get("game_name", "")).strip()
             bgg_id = resolve_bgg_id(game_name) if game_name else None
             if not bgg_id:
+                continue
+            if overlap_bgg_ids is not None and bgg_id not in overlap_bgg_ids:
                 continue
 
             published = parse_datetime_iso(str(obj.get("published_date", "")).strip())
@@ -579,6 +592,8 @@ def export_bgg_reviews_and_collection(
     paths: ProjectPaths,
     cfg: ExportConfig,
     valid_bgg_ids: set[str],
+    *,
+    overlap_only: bool = False,
 ) -> dict[str, int]:
     """
     BGG batch JSONL + collection public comments -> deduped BggReview CSVs.
@@ -793,15 +808,23 @@ def export_bgg_reviews_and_collection(
             if ft is True:
                 wtt_rows.append(meta_for("WANTS_TO_TRADE"))
 
-    usernames: set[str] = {o for _, o in collection_files}
-    for agg in by_key.values():
-        if agg.username:
-            usernames.add(agg.username)
+    review_usernames = {agg.username for agg in by_key.values() if agg.username}
+    if overlap_only:
+        coll_usernames: set[str] = set()
+        for row in owns_rows + wants_rows + wtb_rows + wtt_rows:
+            u = str(row.get("owner_username", "") or "").strip()
+            if u:
+                coll_usernames.add(u)
+        usernames_sorted = sorted(coll_usernames | review_usernames)
+    else:
+        usernames_sorted = sorted(
+            {o for _, o in collection_files} | review_usernames
+        )
 
     users_count = write_csv(
         out / "users.csv",
         ["username"],
-        ({"username": u} for u in sorted(usernames)),
+        ({"username": u} for u in usernames_sorted),
     )
     # TSV: free-text comments often contain commas; Neo4j's CSV parser is strict on quoted commas.
     br_count = write_tsv_neo4j(out / "bgg_reviews.tsv", bgg_review_fields, review_rows())
@@ -828,8 +851,10 @@ def export_bgg_reviews_and_collection(
 def export_all(paths: ProjectPaths, cfg: ExportConfig) -> dict[str, int]:
     ensure_dir(cfg.out_dir)
 
-    games_count, name_by_bgg_id = export_games(paths, cfg)
-    mapping_count = export_mapping(paths, cfg)
+    overlap_bgg_ids: Optional[set[str]] = load_overlap_bgg_ids(paths) if cfg.overlap_only else None
+
+    games_count, name_by_bgg_id = export_games(paths, cfg, overlap_bgg_ids=overlap_bgg_ids)
+    mapping_count = export_mapping(paths, cfg, overlap_bgg_ids=overlap_bgg_ids)
 
     # Build bgo_key -> bgg_id map for price history linking from the exported CSV
     bgg_id_by_bgo_key: dict[str, str] = {}
@@ -839,12 +864,24 @@ def export_all(paths: ProjectPaths, cfg: ExportConfig) -> dict[str, int]:
         if key and bgg_id:
             bgg_id_by_bgo_key[key] = bgg_id
 
-    ranks_count = export_ranks(paths, cfg)
+    ranks_count = export_ranks(paths, cfg, overlap_bgg_ids=overlap_bgg_ids)
     price_points_count = export_price_points(paths, cfg, bgg_id_by_bgo_key=bgg_id_by_bgo_key)
-    reviews_count, review_edges_count = export_reviews(paths, cfg, name_by_bgg_id=name_by_bgg_id)
+    reviews_count, review_edges_count = export_reviews(
+        paths,
+        cfg,
+        name_by_bgg_id=name_by_bgg_id,
+        overlap_bgg_ids=overlap_bgg_ids,
+    )
 
     valid_bgg_ids = set(name_by_bgg_id.keys())
-    bgg_counts = export_bgg_reviews_and_collection(paths, cfg, valid_bgg_ids=valid_bgg_ids)
+    if overlap_bgg_ids is not None:
+        valid_bgg_ids &= overlap_bgg_ids
+    bgg_counts = export_bgg_reviews_and_collection(
+        paths,
+        cfg,
+        valid_bgg_ids=valid_bgg_ids,
+        overlap_only=cfg.overlap_only,
+    )
 
     out = {
         "games": games_count,

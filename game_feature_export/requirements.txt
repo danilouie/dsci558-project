@@ -1,0 +1,8 @@
+# Minimal deps for feature export (repo root may already include these).
+numpy>=1.26.0
+scikit-learn>=1.4.0
+pyarrow>=14.0.0
+faiss-cpu>=1.8.0
+sentence-transformers>=3.0.0
+torch>=2.0.0
+transformers>=4.40.0

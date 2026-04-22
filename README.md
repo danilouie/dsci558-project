@@ -73,6 +73,29 @@ docker restart dsci558-neo4j
 cat neo4j/load/08_verify.cypher | docker exec -i dsci558-neo4j cypher-shell -u neo4j -p password
 ```
 
+### 7) Text embeddings (FAISS + Parquet)
+
+**End-to-end ML steps** (embeddings → per-game features → optional standardization): see [`PIPELINE_README.md`](PIPELINE_README.md).
+
+**Worth / value modeling** (demand head from standardized features, BGO price features, weak BGQ label combiner—flowchart + suggested architectures): see [`docs/WORTH_MODEL.md`](docs/WORTH_MODEL.md).
+
+Embeds `games.csv` descriptions, BGQ `reviews.csv`, and BGG `bgg_reviews*.tsv` from `neo4j/import/` using keys aligned with [`neo4j/SCHEMA.md`](neo4j/SCHEMA.md). Outputs `meta.json`, `index.faiss`, `id_map.parquet`, `vectors.npy`, and `shards/*.parquet` under the chosen output directory.
+
+**Full CLI reference (every flag, inputs, outputs, examples):** [`embeddings/README.md`](embeddings/README.md).
+
+Quick start:
+
+```bash
+python scripts/build_embeddings_faiss.py --output embeddings/bge-small-en-v1.5 --index flat
+python scripts/query_embeddings_faiss.py --artifacts embeddings/bge-small-en-v1.5 --query "cooperative dungeon crawler" -k 10
+```
+
+Join FAISS hits back to Neo4j with [`neo4j/EMBEDDINGS_FAISS_JOINS.md`](neo4j/EMBEDDINGS_FAISS_JOINS.md).
+
+For quick smoke tests without scanning chunked `bgg_reviews` files: `--limit N --skip-bgg-reviews` (see [`embeddings/README.md`](embeddings/README.md)).
+
+To **resume** a long build after a crash, use `--resume` with the same flags and ensure `vectors.npy` exists (omit `--no-vectors-npy`); details in [`embeddings/README.md`](embeddings/README.md).
+
 ## Files
 *Each webscraping component is currently in their own branch.*
 - `bgg_game_scraper.py`: scrapes game info from BoardGameGeek using XML and API token $\rightarrow$ outputs in `games.jsonl`

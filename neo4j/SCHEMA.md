@@ -1,9 +1,13 @@
 ## Neo4j schema (board game knowledge graph)
 
+### Overlap-only export
+
+The CSV pipeline ([`scripts/build_neo4j_csvs.py`](../scripts/build_neo4j_csvs.py)) accepts **`--overlap-only`**. When set, only games whose **`bgg_id`** appears in **`bgo_key_bgg_map.tsv`** (rows with both a non-empty Oracle `key` and `bgg_id`) are written to `games.csv`, `ranks.csv`, and related edges; `bgo_keys.csv` is restricted to that overlap (`export_mapping` with `price_histories/key_name.tsv` keeps only keys present in the mapping TSV and drops rows whose resolved `bgg_id` is outside the overlap). BGQ **`reviews`**, BGG **`bgg_reviews`** / edges, and user–game **`OWNS` / `WANTS*`** rows are emitted only when that **`bgg_id`** is both in the overlap set and present in **`games.jsonl`** (`valid_bgg_ids`). With **`--overlap-only`**, **`users.csv`** is limited to usernames that appear on at least one of those filtered collection or BGG-review edges (owners with no remaining rows after filtering are omitted). Full exports without the flag still list every collection-file owner, as before. Games listed in the mapping but missing from `games.jsonl` export as no `(:Game)` row until the JSONL includes them.
+
 ### Core identifiers
 - **Game**: `bgg_id` (string) is the stable unique ID.
 - **BGOKey**: `key` (string) is the stable unique ID.
-- **PricePoint**: `price_point_id` (string) = `${bgo_key}::${date}` where `date` is `YYYY-MM-DD`.
+- **PricePoint**: `price_point_id` (string) = `${bgg_id}::${date}` where `date` is `YYYY-MM-DD` (see `export_price_points` in `kg_etl/export_csvs.py`).
 - **Review**: `review_id` (string) = BGQ article `url` (stable, unique). **Not** BGG user comments.
 - **BggReview**: `bgg_review_id` (string) = `bggrev:` + SHA-256(`bgg_id`, BGG `username`, comment text after outer trim). Deduplicates `game_review_batches/**/page_*.jsonl` and public `comment` on each `user/*_collection.jsonl` (owner = filename prefix before `_collection.jsonl`) when the triple `(bgg_id, username, exact comment)` matches.
 - **User**: `username` (string) = BGG username (collection owner + comment authors).

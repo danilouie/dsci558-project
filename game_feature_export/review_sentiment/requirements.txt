@@ -1,0 +1,6 @@
+# Sentiment batch job (transformers pipeline). Install in same venv as repo or use:
+#   pip install -r game_feature_export/review_sentiment/requirements.txt
+torch>=2.0.0
+transformers>=4.40.0
+numpy>=1.26.0
+pyarrow>=14.0.0
