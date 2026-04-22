@@ -123,15 +123,19 @@ This document describes who uses the app, what they are trying to do, and how th
 
 ## UC-8: Explore similar games from a center (graph)
 
-**Goal:** “I picked a game—show me neighbors in feature space and let me re-center by clicking.”
+**Goal:** “I picked a game—see related titles and re-center by clicking,” in two different ways depending on how the graph was opened.
 
 **Actor:** Explorer.
 
-**UI:** After any recommendation, click **neighbors** or nodes to call `/api/graph/node/:id`.
+**UI:** After a **recommend** or **search (with graph)**, the orbit shows other **query-matched** games from the same ranked list (top K from `runSearchQuery`, same filters and sort as the list). After **load default**, **open by element id**, or **open by BGG id**, the orbit still uses the older **profile similarity** (`getNeighbors` in [app/backend/src/server.js](app/backend/src/server.js)) because there is no active `QuerySpec` for that request.
 
-**Success:** Neighbors are scored with rating, player/time/year overlap, and list overlap on `categories` / `mechanisms` (see [app/backend/src/server.js](app/backend/src/server.js)).
+**API shape:** The graph JSON includes `neighborMode`: `search_hits` (recommend / search) vs `similarity` (browse / drill-in).
 
-**Limits:** Neighbor view is not filtered by the same `QuerySpec` as search; it is local similarity from the current center.
+**Success (search / recommend path):** Every node in the orbit (except the center) is a hit from the same search list as the current query; order follows the list rank (`#2`, `#3`, … in the UI).
+
+**Success (browse path):** Neighbors are scored with rating, player/time/year overlap, and list overlap on `categories` / `mechanisms`.
+
+**Limits:** The browse path does not apply the same `QuerySpec` as a prior search; it is local similarity from the current center.
 
 ---
 
@@ -155,5 +159,5 @@ This document describes who uses the app, what they are trying to do, and how th
 
 - **Structured filters:** [app/shared/contracts.d.ts](app/shared/contracts.d.ts) — `QuerySpec`, `QueryPresetId`, `SearchRequestBody`.
 - **Search and presets:** [app/backend/src/searchQuery.js](app/backend/src/searchQuery.js) — Cypher, `messageToQuerySpec`, `applyPresetMerge`.
-- **HTTP:** [app/backend/src/server.js](app/backend/src/server.js) — `POST /api/search`, `POST /api/recommend`, optional `searchMeta` on the graph response.
+- **HTTP / graph:** [app/backend/src/server.js](app/backend/src/server.js) — `POST /api/search`, `POST /api/recommend` return a graph built from top search **hits** (`graphFromSearchHits`); `GET` graph routes use `graphFromCenter` + `getNeighbors` when there is no search list.
 - **UI:** [app/frontend/src/App.tsx](app/frontend/src/App.tsx) — filter drawer, preset chips, search explain in the side panel.

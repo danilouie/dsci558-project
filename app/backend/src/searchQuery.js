@@ -1,5 +1,6 @@
 import neo4j from "neo4j-driver";
 import { traceStep } from "./trace.js";
+import { gameNodeToSummary } from "./gameMapper.js";
 
 /**
  * @typedef {import("../../shared/contracts.d.ts").QuerySpec} QuerySpec
@@ -92,69 +93,38 @@ export function applyPresetMerge(spec, preset) {
  * @param {string} message
  * @returns {Partial<QuerySpec>}
  */
+/**
+ * Non-Ollama fallback: pass the message through as a keyword only (no regex heuristics).
+ * Does not set sort/sortDirection so merged specs keep UI or default ordering from applyPresetMerge.
+ * @param {string} message
+ * @returns {Partial<QuerySpec>}
+ */
 export function messageToQuerySpec(message) {
   const raw = String(message || "").trim();
   if (!raw) return {};
-
-  const m = /** @type {Partial<QuerySpec>} */ ({});
-
-  const lower = raw.toLowerCase();
-
-  const underMatch = lower.match(/under\s*\$?\s*(\d+)/);
-  if (underMatch) m.maxPrice = Number(underMatch[1]);
-
-  const belowMatch = lower.match(/less\s*than\s*\$?\s*(\d+)/);
-  if (belowMatch && m.maxPrice == null) m.maxPrice = Number(belowMatch[1]);
-
-  if (m.maxPrice == null) {
-    const dollarM = lower.match(/\$(\d+)|(?:\b(\d{1,3})\b)/);
-    if (/\b(cheap|affordable|budget|under)\b/.test(lower) && dollarM) {
-      const n = Number(dollarM[1] || dollarM[2]);
-      if (n > 0 && n < 200) m.maxPrice = n;
-    }
-  }
-
-  const pMatch = raw.match(/(\d+)\s*player/i);
-  if (pMatch) m.players = Number(pMatch[1]);
-
-  const timeMatch = raw.match(/(\d+)\s*(min|minute|minutes)\b/i);
-  if (timeMatch) m.maxTime = Number(timeMatch[1]);
-
-  const minR = lower.match(
-    /(?:rating|rated)\s*(?:(?:at least|over|>|above|≥)\s*)?([0-9]+(?:\.[0-9])?)(?:\s*stars?)?/i
-  );
-  if (minR) m.minRating = Math.min(10, Number(minR[1]));
-
-  if (/(undervalued|greatest value|worth more|best bang)/i.test(lower)) m.undervaluedOnly = true;
-  if (/(overpriced|not worth (?:it|the|their) price|poor value for money)/i.test(lower)) m.overpricedOnly = true;
-  if (/(want but don|do not (?:yet )?own|sought-?after|on many wish|high demand games)/i.test(lower)) m.minWants = m.minWants ?? 1;
-  if (/(trade|trades away|people trade|swap)/i.test(lower) && m.sort == null) m.sort = "wtt";
-
-  const cats = /** @type {string[]} */ ([]);
-  if (/(strategy|strateg(y|ic) game)/i.test(raw)) cats.push("strategy");
-  if (/(co-?op|cooperative)/i.test(raw)) cats.push("cooperative");
-  if (/(abstract|abstracts)/i.test(raw)) cats.push("abstract");
-  if (/(party game)/i.test(raw)) cats.push("party");
-  if (cats.length) m.categoryContains = cats;
-
-  if (m.sort == null && m.maxPrice != null) m.sort = "mean_price";
-  if (m.sort == null) m.sort = "rating";
-  m.keyword = raw;
-  if (m.keyword && m.keyword.length > 120) m.keyword = m.keyword.slice(0, 120);
-
-  return m;
+  const kw = raw.length > 120 ? raw.slice(0, 120) : raw;
+  return { keyword: kw };
 }
 
 /**
- * @param {Partial<QuerySpec>} fromMessage
- * @param {Partial<QuerySpec>} explicit
+ * Merges UI / API "base" filters (often defaults) with message-derived (NL) fields.
+ * The message layer wins for any key it sets, so a prompt like "under 40" is not replaced
+ * by the filter bar's maxPrice until the user clears or changes the text.
+ *
+ * @param {Partial<QuerySpec>} base - explicit filters from UI or `query` (lower priority)
+ * @param {Partial<QuerySpec>} messageDerived - Ollama partial or `messageToQuerySpec` (wins on conflict)
  * @param {import("../../shared/contracts.d.ts").QueryPresetId | null | undefined} presetFromFilter
  */
-export function mergeQuerySpec(fromMessage, explicit, presetFromFilter) {
-  const a = { ...fromMessage };
-  const b = { ...explicit };
-  const p = b.preset ?? presetFromFilter ?? a.preset;
-  return applyPresetMerge({ ...a, ...b, preset: p != null ? p : b.preset ?? a.preset }, p);
+export function mergeQuerySpec(base, messageDerived, presetFromFilter) {
+  const merged = { ...base };
+  for (const [k, v] of Object.entries(messageDerived)) {
+    if (v !== undefined) {
+      merged[/** @type {keyof import("../../shared/contracts.d.ts").QuerySpec} */ (k)] = v;
+    }
+  }
+  const hasMsgPreset = Object.hasOwn(/** @type {object} */ (messageDerived), "preset");
+  const p = hasMsgPreset ? messageDerived.preset : base.preset ?? presetFromFilter;
+  return applyPresetMerge(merged, p);
 }
 
 function toNum(v) {
@@ -169,24 +139,10 @@ function toNum(v) {
  * @param {import("../../shared/contracts.d.ts").SearchSortField} sort
  */
 function nodeToGameWithExplain(node, ex, sort) {
-  const p = node.properties;
+  const est = ex.meanPrice;
+  const base = gameNodeToSummary(node, { estimatedPrice: est != null && Number.isFinite(Number(est)) ? Number(est) : null });
   return {
-    id: node.elementId,
-    bggId: p.bgg_id == null ? null : String(p.bgg_id),
-    name: p.name == null ? "Unknown Game" : String(p.name),
-    yearPublished: toNum(p.yearpublished ?? p.year_published),
-    minPlayers: toNum(p.minplayers ?? p.min_players),
-    maxPlayers: toNum(p.maxplayers ?? p.max_players),
-    playTime: toNum(p.playingtime ?? p.maxplaytime ?? p.play_time),
-    rating: toNum(
-      p.geek_rating != null
-        ? p.geek_rating
-        : p.bayesavg != null
-          ? p.bayesavg
-          : p.average
-    ),
-    usersRated: toNum(p.usersrated ?? p.num_voters),
-    complexity: toNum(p.complexity),
+    ...base,
     searchExplain: { ...ex, sort, preset: ex.preset }
   };
 }
@@ -346,7 +302,8 @@ function formatNeoDate(d) {
 
 const CYPHER_SEARCH = `
   MATCH (g:Game)
-  WHERE ($kw IS NULL OR toLower(coalesce(g.name, "")) CONTAINS toLower($kw))
+  WHERE (size($bggAllow) = 0 OR toString(g.bgg_id) IN $bggAllow)
+    AND ($kw IS NULL OR toLower(coalesce(g.name, "")) CONTAINS toLower($kw))
     AND ($players IS NULL OR toInteger(coalesce(g.min_players, g.minplayers, 0)) <= $players)
     AND ($maxTime IS NULL OR toInteger(coalesce(g.playingtime, g.maxplaytime, g.play_time, 9999)) <= $maxTime)
   WITH g, coalesce(g.categories, $emptyList) AS cats, coalesce(g.mechanisms, $emptyList) AS mechs
@@ -462,7 +419,13 @@ export async function runSearchQuery(_driver, _database, runQuery, spec0, neo4jR
   const kwParam =
     spec.keyword == null || String(spec.keyword).trim() === "" ? null : String(spec.keyword).trim();
 
+  const bggAllow =
+    spec.bggIdAllowList && spec.bggIdAllowList.length
+      ? spec.bggIdAllowList.map((x) => String(x))
+      : [];
+
   const params = {
+    bggAllow: bggAllow,
     kw: kwParam,
     players: spec.players != null ? neo4jRef.int(spec.players) : null,
     maxTime: spec.maxTime != null ? neo4jRef.int(spec.maxTime) : null,
@@ -493,6 +456,7 @@ export async function runSearchQuery(_driver, _database, runQuery, spec0, neo4jR
 
   traceStep("search", "3. cypher params ready", {
     hasKeyword: params.kw != null,
+    bggAllowCount: bggAllow.length,
     catNeedles: params.catNeedles.length,
     mechNeedles: params.mechNeedles.length,
     candidateCap: capN,

@@ -1,0 +1,9 @@
+{
+  "schema_ref": "neo4j/SCHEMA.md",
+  "embedding_kind": "game_id_name",
+  "created_at": "2026-04-22T19:59:52.321089+00:00",
+  "neo4j_import": "/Users/vishalsankarram/dsci558-project/neo4j/import",
+  "games_csv": "/Users/vishalsankarram/dsci558-project/neo4j/import/games.csv",
+  "model_name": "sentence-transformers/all-MiniLM-L6-v2",
+  "num_vectors": 31764
+}

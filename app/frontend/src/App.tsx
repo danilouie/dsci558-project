@@ -5,6 +5,7 @@ import type {
   GraphApiResponse,
   GraphNode,
   GraphPayload,
+  NlParseMeta,
   QueryPresetId,
   RecommendRequestBody,
   SearchMeta,
@@ -46,11 +47,22 @@ function applySearchMetaToGraph(graph: GraphPayload, searchMeta: SearchMeta | nu
   const { game, explain } = searchMeta.topHit;
   return {
     ...graph,
-    nodes: graph.nodes.map((n) =>
-        n.id === game.id && n.kind === "center"
-        ? { ...n, ...game, searchExplain: explain }
-        : n
-    )
+    nodes: graph.nodes.map((n) => {
+      if (n.id !== game.id || n.kind !== "center") return n;
+      const fromExplain = explain?.meanPrice;
+      const mergedEst =
+        fromExplain != null && Number.isFinite(fromExplain)
+          ? fromExplain
+          : game.estimatedPrice != null && Number.isFinite(game.estimatedPrice)
+            ? game.estimatedPrice
+            : n.estimatedPrice;
+      return {
+        ...n,
+        ...game,
+        searchExplain: explain,
+        estimatedPrice: mergedEst != null && Number.isFinite(mergedEst) ? mergedEst : n.estimatedPrice ?? null
+      };
+    })
   };
 }
 
@@ -81,6 +93,7 @@ function buildDemoGraph(centerId = demoCatalog[0].id): GraphPayload {
 
   return {
     centerId: center.id,
+    neighborMode: "similarity",
     nodes: [center, ...neighbors],
     edges: neighbors.map((neighbor) => ({
       id: `${center.id}->${neighbor.id}`,
@@ -142,6 +155,50 @@ function formatStat(value: string | number | null | undefined, suffix = ""): str
   return `${value}${suffix}`;
 }
 
+function formatPlayTimeBlock(g: GameSummary): string {
+  if (g.minPlaytime != null || g.maxPlaytime != null) {
+    const a = g.minPlaytime ?? g.maxPlaytime;
+    const b = g.maxPlaytime ?? g.minPlaytime;
+    if (a != null && b != null && a !== b) return `${a}–${b} min`;
+    if (a != null) return `${a} min`;
+    return "-";
+  }
+  return formatStat(g.playTime, " min");
+}
+
+function formatBool(v: boolean | null | undefined): string {
+  if (v === true) return "Yes";
+  if (v === false) return "No";
+  return "—";
+}
+
+function formatEstPrice(g: GameSummary): string {
+  const p = g.searchExplain?.meanPrice ?? g.estimatedPrice;
+  if (p == null || !Number.isFinite(p)) return "—";
+  return `$${p.toFixed(2)}`;
+}
+
+/** Latest mean price for display: search explain, then graph est. (same as formatEstPrice, number). */
+function coalesceEstPriceNumber(g: GameSummary): number | null {
+  const p = g.searchExplain?.meanPrice ?? g.estimatedPrice;
+  if (p == null || !Number.isFinite(p)) return null;
+  return p;
+}
+
+function estPriceLabelSuffix(g: GameSummary): string {
+  const p = coalesceEstPriceNumber(g);
+  if (p == null) return "";
+  return ` · $${p.toFixed(0)}`;
+}
+
+/** Orbit line under name: search rank vs profile-similarity % (browse graph). */
+function neighborOrbitCaption(graph: GraphPayload, node: GraphNode): string {
+  if (graph.neighborMode === "search_hits" && node.queryResultRank != null && node.queryResultRank >= 2) {
+    return `#${node.queryResultRank} in results`;
+  }
+  return `${Math.round((node.similarity ?? 0) * 100)}% match`;
+}
+
 function stableUnit(id: string, salt = 0): number {
   let hash = 2166136261 ^ salt;
 
@@ -164,9 +221,11 @@ interface GraphCanvasProps {
   graph: GraphPayload;
   activeNodeId: string;
   onNodeClick: (node: GraphNode) => void;
+  /** When set, center node shows this BGG id (prompt reference game) instead of "Recommended". */
+  promptAnchorBggId?: string | null;
 }
 
-function GraphCanvas({ graph, activeNodeId, onNodeClick }: GraphCanvasProps) {
+function GraphCanvas({ graph, activeNodeId, onNodeClick, promptAnchorBggId = null }: GraphCanvasProps) {
   const [focusOffset, setFocusOffset] = useState<Position>({ x: 0, y: 0, scale: 1, opacity: 1 });
   const [dragOffset, setDragOffset] = useState({ x: 0, y: 0 });
   const suppressClickUntilRef = useRef<number>(0);
@@ -197,7 +256,12 @@ function GraphCanvas({ graph, activeNodeId, onNodeClick }: GraphCanvasProps) {
 
   const neighbors = graph.nodes
     .filter((node) => node.id !== center.id)
-    .sort((left, right) => (right.similarity ?? 0) - (left.similarity ?? 0));
+    .sort((left, right) => {
+      if (graph.neighborMode === "search_hits") {
+        return (left.queryResultRank ?? 0) - (right.queryResultRank ?? 0);
+      }
+      return (right.similarity ?? 0) - (left.similarity ?? 0);
+    });
   const layout = useMemo(() => {
     interface MutableOrbitNode {
       id: string;
@@ -344,7 +408,7 @@ function GraphCanvas({ graph, activeNodeId, onNodeClick }: GraphCanvasProps) {
     });
 
     return positions;
-  }, [activeNodeId, center.id, neighbors]);
+  }, [activeNodeId, center.id, graph.neighborMode, neighbors]);
 
   function rotateAndSelectNode(node: GraphNode): void {
     if (Date.now() < suppressClickUntilRef.current) return;
@@ -396,16 +460,26 @@ function GraphCanvas({ graph, activeNodeId, onNodeClick }: GraphCanvasProps) {
     };
   }
 
+  function estSuffix(n: GraphNode): string {
+    const p = n.searchExplain?.meanPrice ?? n.estimatedPrice;
+    if (p == null || !Number.isFinite(p)) return "";
+    return ` · est. $${p.toFixed(0)}`;
+  }
+
   function nodeTooltip(node: GraphNode, position: LayoutNode): string {
     if (position.shape === "secondary") {
-      return `${node.name} | outer related node`;
+      const sub =
+        graph.neighborMode === "search_hits" && node.queryResultRank != null
+          ? ` #${node.queryResultRank} in results`
+          : " outer related node";
+      return `${node.name} |${sub}${estSuffix(node)}`;
     }
 
     if (position.shape === "primary") {
-      return `${node.name} | ${Math.round((node.similarity ?? 0) * 100)}% match`;
+      return `${node.name} | ${neighborOrbitCaption(graph, node)}${estSuffix(node)}`;
     }
 
-    return `${node.name} | center node`;
+    return `${node.name} | center node${estSuffix(node)}`;
   }
 
   function beginDrag(event: ReactPointerEvent<HTMLDivElement>): void {
@@ -519,7 +593,14 @@ function GraphCanvas({ graph, activeNodeId, onNodeClick }: GraphCanvasProps) {
                   {isCenter || position.shape === "primary" ? <span className="node-name">{node.name}</span> : <span className="node-dot" aria-hidden="true" />}
                   {isCenter || position.shape === "primary" ? (
                     <span className="node-meta">
-                      {isCenter ? "Recommended" : `${Math.round((node.similarity ?? 0) * 100)}% match`}
+                      {isCenter
+                        ? promptAnchorBggId
+                          ? `BGG ${promptAnchorBggId}`
+                          : graph.neighborMode === "search_hits"
+                            ? "Top result"
+                            : "Recommended"
+                        : neighborOrbitCaption(graph, node)}
+                      {estPriceLabelSuffix(node)}
                     </span>
                   ) : null}
                 </span>
@@ -544,6 +625,8 @@ function App() {
   const [status, setStatus] = useState<string>("Showing a starter graph. Ask for a recommendation or click a node.");
   const [filtersOpen, setFiltersOpen] = useState<boolean>(false);
   const [chatOpen, setChatOpen] = useState<boolean>(false);
+  /** Set when /api/recommend returns nlParse (prompt anchor BGG id for similarity queries). */
+  const [promptNlParse, setPromptNlParse] = useState<NlParseMeta | null>(null);
 
   useEffect(() => {
     let ignore = false;
@@ -561,6 +644,7 @@ function App() {
         setGraph(payload.graph);
         setActiveNodeId(payload.graph.centerId);
         setSelectedGame(getCenterNode(payload.graph));
+        setPromptNlParse(null);
         setStatus("Loaded a Neo4j-backed starter recommendation.");
       } catch (fetchError) {
         if (ignore) return;
@@ -599,7 +683,29 @@ function App() {
       }
 
       const payload = (await response.json()) as GraphApiResponse;
-      const nextGraph = applySearchMetaToGraph(payload.graph, payload.searchMeta ?? null);
+      setPromptNlParse(payload.nlParse ?? null);
+
+      let nextGraph = applySearchMetaToGraph(payload.graph, payload.searchMeta ?? null);
+
+      const anchorBgg = payload.nlParse?.anchorBggId;
+      const pk = payload.nlParse?.promptKind;
+      const recenterOnAnchor =
+        Boolean(anchorBgg) && (pk === "similar_to_game" || pk === "both");
+
+      if (recenterOnAnchor) {
+        try {
+          const anchorRes = await fetch(
+            `${API_URL}/api/graph/bgg/${encodeURIComponent(String(anchorBgg))}`
+          );
+          if (anchorRes.ok) {
+            const anchorPayload = (await anchorRes.json()) as GraphApiResponse;
+            nextGraph = anchorPayload.graph;
+          }
+        } catch {
+          /* keep search-ranked center graph */
+        }
+      }
+
       setGraph(nextGraph);
       setActiveNodeId(nextGraph.centerId);
       setSelectedGame(getCenterNode(nextGraph));
@@ -614,7 +720,10 @@ function App() {
 
   async function handlePromptSubmit(event: FormEvent<HTMLFormElement>): Promise<void> {
     event.preventDefault();
-    await loadRecommendation({ message: prompt, filters: toRequestFilters(filters) }, "Prompt-based recommendation loaded.");
+    await loadRecommendation(
+      { message: prompt },
+      "Prompt-based recommendation loaded."
+    );
     setChatOpen(false);
   }
 
@@ -642,6 +751,7 @@ function App() {
         setGraph(nextGraph);
         setActiveNodeId(nextGraph.centerId);
         setSelectedGame(getCenterNode(nextGraph));
+        setPromptNlParse(null);
         setStatus(`Animated toward ${node.name} in the demo graph.`);
         return;
       }
@@ -656,6 +766,7 @@ function App() {
       setGraph(payload.graph);
       setActiveNodeId(payload.graph.centerId);
       setSelectedGame(getCenterNode(payload.graph));
+      setPromptNlParse(null);
       setStatus(`Graph shifted to ${node.name}.`);
     } catch (clickError) {
       setError(clickError instanceof Error ? clickError.message : "Node click failed.");
@@ -684,9 +795,23 @@ function App() {
         </div>
 
         <div className="hero-stats compact">
+          {promptNlParse?.anchorBggId ? (
+            <article className="hero-anchor-bgg">
+              <span>Prompt reference · BGG ID</span>
+              <strong className="hero-bgg-id">{promptNlParse.anchorBggId}</strong>
+              {promptNlParse.similarToGame ? (
+                <span className="hero-anchor-title">{promptNlParse.similarToGame}</span>
+              ) : null}
+            </article>
+          ) : null}
           <article>
             <span>Center game</span>
             <strong>{centerNode?.name || "Unknown"}</strong>
+            {promptNlParse?.anchorBggId &&
+            centerNode?.bggId &&
+            String(centerNode.bggId) === String(promptNlParse.anchorBggId) ? (
+              <span className="hero-center-bgg">BGG {centerNode.bggId}</span>
+            ) : null}
           </article>
           <article>
             <span>Neighbors</span>
@@ -704,6 +829,13 @@ function App() {
           <div className="drawer-top">
             <div>
               <p className="drawer-kicker">Game info</p>
+              {promptNlParse?.anchorBggId &&
+              selectedGame?.bggId &&
+              String(selectedGame.bggId) === String(promptNlParse.anchorBggId) ? (
+                <p className="panel-anchor-kicker">
+                  Prompt reference · BGG ID <strong>{promptNlParse.anchorBggId}</strong>
+                </p>
+              ) : null}
               <h2>{selectedGame?.name || "Select a game"}</h2>
             </div>
           </div>
@@ -724,24 +856,30 @@ function App() {
                   </article>
                   <article>
                     <span>Play time</span>
-                    <strong>{formatStat(selectedGame.playTime, " min")}</strong>
+                    <strong>{formatPlayTimeBlock(selectedGame)}</strong>
                   </article>
                   <article>
                     <span>Users rated</span>
                     <strong>{formatStat(selectedGame.usersRated?.toLocaleString() ?? selectedGame.usersRated)}</strong>
                   </article>
+                  <article>
+                    <span>Complexity</span>
+                    <strong>
+                      {selectedGame.complexity == null ? "—" : selectedGame.complexity.toFixed(2)}
+                    </strong>
+                  </article>
+                  <article>
+                    <span>Min age</span>
+                    <strong>{formatStat(selectedGame.minAge)}</strong>
+                  </article>
+                  <article>
+                    <span>Est. price</span>
+                    <strong>{formatEstPrice(selectedGame)}</strong>
+                  </article>
                 </div>
 
                 {selectedGame.searchExplain ? (
                   <div className="info-stat-grid">
-                    <article>
-                      <span>Est. price</span>
-                      <strong>
-                        {selectedGame.searchExplain.meanPrice == null
-                          ? "—"
-                          : `$${selectedGame.searchExplain.meanPrice.toFixed(2)}`}
-                      </strong>
-                    </article>
                     <article>
                       <span>$/rating</span>
                       <strong>
@@ -767,14 +905,25 @@ function App() {
 
                 <div className="info-section">
                   <h3>Details</h3>
-                  <p>
+                  <p className="panel-context-line">
                     {selectedGame.kind === "center"
-                      ? "This is the current focus game in the graph."
+                      ? "Current focus game in the graph."
                       : selectedGame.kind === "neighbor"
-                        ? "This game is connected as a nearby recommendation in the current graph view."
-                        : "This is a selected game from the knowledge graph."}
+                        ? "Nearby recommendation in this graph view."
+                        : "Selected from the knowledge graph."}
                   </p>
-                  <dl>
+                  {selectedGame.bggId ? (
+                    <p className="bgg-external">
+                      <a
+                        href={`https://boardgamegeek.com/boardgame/${selectedGame.bggId}`}
+                        target="_blank"
+                        rel="noreferrer"
+                      >
+                        Open on BoardGameGeek →
+                      </a>
+                    </p>
+                  ) : null}
+                  <dl className="detail-dl-rich">
                     <div>
                       <dt>BGG ID</dt>
                       <dd>{selectedGame.bggId || "—"}</dd>
@@ -783,28 +932,89 @@ function App() {
                       <dt>Year</dt>
                       <dd>{formatStat(selectedGame.yearPublished)}</dd>
                     </div>
+                    {selectedGame.rank != null ? (
+                      <div>
+                        <dt>BGG rank</dt>
+                        <dd>{formatStat(selectedGame.rank)}</dd>
+                      </div>
+                    ) : null}
                     <div>
-                      <dt>Similarity</dt>
-                      <dd>{formatStat(Math.round((selectedGame.similarity ?? 0) * 100), "%")}</dd>
+                      <dt>{graph.neighborMode === "search_hits" ? "Result rank" : "Similarity"}</dt>
+                      <dd>
+                        {selectedGame.kind === "center"
+                          ? graph.neighborMode === "search_hits" && selectedGame.queryResultRank != null
+                            ? `#${selectedGame.queryResultRank} (current query list)`
+                            : "—"
+                          : graph.neighborMode === "search_hits" && selectedGame.queryResultRank != null
+                            ? `#${selectedGame.queryResultRank} of this query’s list`
+                            : formatStat(Math.round((selectedGame.similarity ?? 0) * 100), "%")}
+                      </dd>
+                    </div>
+                    {selectedGame.geekRating != null ? (
+                      <div>
+                        <dt>Geek rating</dt>
+                        <dd>{selectedGame.geekRating.toFixed(3)}</dd>
+                      </div>
+                    ) : null}
+                    {selectedGame.averageRating != null ? (
+                      <div>
+                        <dt>Average rating</dt>
+                        <dd>{selectedGame.averageRating.toFixed(3)}</dd>
+                      </div>
+                    ) : null}
+                    {selectedGame.numVoters != null ? (
+                      <div>
+                        <dt>Avg. rating voters</dt>
+                        <dd>{selectedGame.numVoters.toLocaleString()}</dd>
+                      </div>
+                    ) : null}
+                    {selectedGame.bestMinPlayers != null || selectedGame.bestMaxPlayers != null ? (
+                      <div>
+                        <dt>Best at</dt>
+                        <dd>
+                          {formatStat(selectedGame.bestMinPlayers)} – {formatStat(selectedGame.bestMaxPlayers)} players
+                        </dd>
+                      </div>
+                    ) : null}
+                    <div>
+                      <dt>Expansion</dt>
+                      <dd>{formatBool(selectedGame.isExpansion)}</dd>
                     </div>
                   </dl>
                 </div>
 
-                <div className="info-section info-section-tall">
-                  <h3>Scrollable notes</h3>
-                  <p>
-                    Click another node to replace this panel with the newly focused game. The drawer is
-                    intentionally scrollable so longer metadata stays usable alongside the graph.
-                  </p>
-                  <p>
-                    The graph supports direct dragging across the network, so you can pan while keeping
-                    the selected game pinned in view.
-                  </p>
-                  <p>
-                    Outer nodes stay compact and clickable, while the main node and primary neighbors keep
-                    the recommended area easy to scan.
-                  </p>
-                </div>
+                {(selectedGame.categories?.length ?? 0) > 0 ? (
+                  <div className="info-section">
+                    <h3>Categories</h3>
+                    <div className="tag-row">
+                      {selectedGame.categories!.map((c) => (
+                        <span key={c} className="bgg-chip">
+                          {c}
+                        </span>
+                      ))}
+                    </div>
+                  </div>
+                ) : null}
+
+                {(selectedGame.mechanisms?.length ?? 0) > 0 ? (
+                  <div className="info-section">
+                    <h3>Mechanisms</h3>
+                    <div className="tag-row">
+                      {selectedGame.mechanisms!.map((m) => (
+                        <span key={m} className="bgg-chip">
+                          {m}
+                        </span>
+                      ))}
+                    </div>
+                  </div>
+                ) : null}
+
+                {selectedGame.description ? (
+                  <div className="info-section info-section-tall">
+                    <h3>Description</h3>
+                    <div className="game-description">{selectedGame.description}</div>
+                  </div>
+                ) : null}
               </>
             ) : (
               <p className="panel-note">Click a node to open game details here.</p>
@@ -820,7 +1030,12 @@ function App() {
             </div>
           </div>
 
-          <GraphCanvas graph={graph} activeNodeId={activeNodeId} onNodeClick={handleNodeClick} />
+          <GraphCanvas
+            graph={graph}
+            activeNodeId={activeNodeId}
+            onNodeClick={handleNodeClick}
+            promptAnchorBggId={promptNlParse?.anchorBggId ?? null}
+          />
 
           <div className="neighbor-strip">
             {graph.nodes
@@ -828,7 +1043,17 @@ function App() {
               .map((node) => (
                 <button key={node.id} className="neighbor-pill" onClick={() => handleNodeClick(node)} type="button">
                   <span>{node.name}</span>
-                  <small>{formatStat(Math.round((node.similarity ?? 0) * 100), "%")}</small>
+                  <small>
+                    {(() => {
+                      const cap =
+                        graph.neighborMode === "search_hits" && node.queryResultRank != null
+                          ? `#${node.queryResultRank}`
+                          : formatStat(Math.round((node.similarity ?? 0) * 100), "%");
+                      const p = node.searchExplain?.meanPrice ?? node.estimatedPrice;
+                      if (p != null && Number.isFinite(p)) return `${cap} · $${p.toFixed(0)}`;
+                      return cap;
+                    })()}
+                  </small>
                 </button>
               ))}
           </div>

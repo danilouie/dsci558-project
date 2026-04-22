@@ -8,6 +8,12 @@ import {
   mergeQuerySpec
 } from "./searchQuery.js";
 import { isTraceEnabled, traceStep } from "./trace.js";
+import {
+  buildQuerySpecFromNaturalLanguage,
+  parseNaturalLanguageMessage,
+  USE_OLLAMA_NL
+} from "./nlQuery.js";
+import { gameNodeToSummary } from "./gameMapper.js";
 
 /** @typedef {import("../../shared/contracts.d.ts").ApiErrorResponse} ApiErrorResponse */
 /** @typedef {import("../../shared/contracts.d.ts").GameSummary} GameSummary */
@@ -17,6 +23,7 @@ import { isTraceEnabled, traceStep } from "./trace.js";
 /** @typedef {import("../../shared/contracts.d.ts").QuerySpec} QuerySpec */
 /** @typedef {import("../../shared/contracts.d.ts").SearchRequestBody} SearchRequestBody */
 /** @typedef {import("../../shared/contracts.d.ts").QueryPresetId} QueryPresetId */
+/** @typedef {import("../../shared/contracts.d.ts").SearchHit} SearchHit */
 
 const PORT = Number(process.env.PORT || 4000);
 const NEO4J_URI = process.env.NEO4J_URI || "bolt://localhost:7687";
@@ -56,33 +63,28 @@ function toNumber(value, fallback = null) {
   return Number.isFinite(parsed) ? parsed : fallback;
 }
 
-function toStringOrNull(value) {
-  if (value == null) return null;
-  return String(value);
+/** @param {unknown} v */
+function recordFloatOrNull(v) {
+  if (v == null) return null;
+  if (typeof v === "object" && "toNumber" in /** @type {object} */ (v)) {
+    try {
+      const n = /** @type {{ toNumber: () => number }} */ (v).toNumber();
+      return Number.isFinite(n) ? n : null;
+    } catch {
+      return null;
+    }
+  }
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
 }
 
-/** @returns {GameSummary} */
-function nodeToGame(node) {
-  const properties = node.properties;
-  return {
-    id: node.elementId,
-    bggId: toStringOrNull(properties.bgg_id),
-    name: toStringOrNull(properties.name) || "Unknown Game",
-    yearPublished: toNumber(properties.yearpublished ?? properties.year_published),
-    minPlayers: toNumber(properties.minplayers ?? properties.min_players),
-    maxPlayers: toNumber(properties.maxplayers ?? properties.max_players),
-    playTime: toNumber(
-      properties.playingtime ?? properties.maxplaytime ?? properties.playing_time
-    ),
-    rating: toNumber(
-      properties.geek_rating != null
-        ? properties.geek_rating
-        : properties.bayesavg ?? properties.average,
-      0
-    ),
-    usersRated: toNumber(properties.usersrated, 0),
-    complexity: toNumber(properties.complexity)
-  };
+/**
+ * @param {import("neo4j-driver").Node} node
+ * @param {{ estimatedPrice?: number | null }} [opts]
+ * @returns {GameSummary}
+ */
+function nodeToGame(node, opts) {
+  return gameNodeToSummary(node, { estimatedPrice: opts?.estimatedPrice });
 }
 
 /**
@@ -120,34 +122,27 @@ async function runQuery(cypher, params = {}, label = "cypher") {
  * @param {RecommendRequestBody | SearchRequestBody} body
  * @param {import("../../shared/contracts.d.ts").RecommendRequestBody["filters"]} [f]
  */
-function bodyToQuerySpec(body = {}, f = body.filters) {
-  traceStep("recommend", "1. bodyToQuerySpec: parse message heuristics + filters");
+async function bodyToQuerySpecAsync(body = {}, f = body.filters) {
+  traceStep("recommend", "1. bodyToQuerySpec: NL + filters");
   const fl = f || {};
-  const fromMsg = messageToQuerySpec(String(body.message || ""));
-  const merged = mergeQuerySpec(
-    fromMsg,
-    {
-      keyword: fl.keyword != null && fl.keyword !== "" ? String(fl.keyword) : undefined,
-      players: toNumber(fl.players) ?? null,
-      maxTime: toNumber(fl.maxTime) ?? null,
-      maxPrice: toNumber(fl.maxPrice) ?? null,
-      minRating: toNumber(fl.minRating) ?? null,
-      sort: fl.sort,
-      limit: 40
-    },
-    fl.preset ?? null
-  );
+  const { spec: merged, nlParse } = await buildQuerySpecFromNaturalLanguage({
+    message: String(body.message || ""),
+    filters: fl,
+    limit: 40,
+    runQuery
+  });
   traceStep("recommend", "2. merged QuerySpec for /recommend", {
     messageSnippet: (body.message && String(body.message).slice(0, 60)) || null,
+    useOllama: USE_OLLAMA_NL,
     ...merged
   });
-  return merged;
+  return { spec: merged, nlParse };
 }
 
 /**
  * @param {SearchRequestBody} body
  */
-function parseSearchRequest(body = {}) {
+async function parseSearchRequest(body = {}) {
   traceStep("search-api", "1. parseSearchRequest: incoming", {
     hasMessage: Boolean(body.message),
     hasQuery: Boolean(body.query),
@@ -156,19 +151,38 @@ function parseSearchRequest(body = {}) {
     includeGraph: Boolean(body.includeGraph)
   });
   const mergeMessage = body.mergeMessage !== false;
-  const fromMsg = mergeMessage ? messageToQuerySpec(String(body.message || "")) : {};
+  let fromMsg = {};
+  /** @type {import("../../shared/contracts.d.ts").NlParseMeta | null} */
+  let nlParse = null;
+  if (mergeMessage && String(body.message || "").trim()) {
+    if (USE_OLLAMA_NL) {
+      const r = await parseNaturalLanguageMessage({
+        message: String(body.message || ""),
+        runQuery
+      });
+      fromMsg = r.partial;
+      nlParse = r.nlParse;
+    } else {
+      fromMsg = messageToQuerySpec(String(body.message || ""));
+    }
+  }
   const ex = body.query && typeof body.query === "object" ? body.query : {};
   const legacyF = body.filters && typeof body.filters === "object" ? body.filters : {};
+  const hasMsg = mergeMessage && String(body.message || "").trim();
+  const structured = { ...ex, ...legacyF };
   const merged = mergeQuerySpec(
+    hasMsg ? {} : structured,
     fromMsg,
-    { ...ex, ...legacyF },
-    /** @type {import("../../shared/contracts.d.ts").QueryPresetId | null} */ (
-      ex.preset ?? legacyF.preset
-    ) ?? null
+    hasMsg
+      ? undefined
+      : /** @type {import("../../shared/contracts.d.ts").QueryPresetId | null} */ (ex.preset ?? legacyF.preset) ?? null
   );
   if (body.limit != null) merged.limit = body.limit;
-  traceStep("search-api", "2. parseSearchRequest: merged spec", { ...merged, includeGraph: Boolean(body.includeGraph) });
-  return { query: merged, includeGraph: Boolean(body.includeGraph) };
+  traceStep("search-api", "2. parseSearchRequest: merged spec", {
+    ...merged,
+    includeGraph: Boolean(body.includeGraph)
+  });
+  return { query: merged, includeGraph: Boolean(body.includeGraph), nlParse };
 }
 
 async function pickCenter(criteria) {
@@ -255,7 +269,18 @@ async function getNeighbors(centerElementId, limit = 30) {
          + categoryScore
          + mechanicScore
          AS similarity
-    RETURN other, similarity, users
+    WITH other, users, similarity
+    OPTIONAL MATCH (other)-[:HAS_PRICE_POINT]->(p:PricePoint)
+    WITH other, users, similarity, p
+    ORDER BY p.date DESC
+    WITH other, users, similarity, collect(p) AS pcol
+    WITH other, users, similarity,
+         CASE
+           WHEN size(pcol) = 0 OR pcol[0] IS NULL
+           THEN null
+           ELSE toFloat(pcol[0].mean_price)
+         END AS estPrice
+    RETURN other, users, similarity, estPrice
     ORDER BY similarity DESC, users DESC
     LIMIT $limit
     `,
@@ -269,22 +294,106 @@ async function getNeighbors(centerElementId, limit = 30) {
   traceStep("graph", "2. getNeighbors: rows", { neighborCount: result.records.length });
   return result.records.map((record) => ({
     node: record.get("other"),
-    similarity: normalizeNeighborSimilarity(record.get("similarity"))
+    similarity: normalizeNeighborSimilarity(record.get("similarity")),
+    estPrice: record.get("estPrice")
   }));
+}
+
+/**
+ * Latest mean PricePoint mean_price for a :Game, by element id.
+ * @param {string} elementId
+ */
+async function fetchEstPriceByElementId(elementId) {
+  const result = await runQuery(
+    `
+    MATCH (g:Game) WHERE elementId(g) = $eid
+    CALL {
+      WITH g
+      OPTIONAL MATCH (g)-[:HAS_PRICE_POINT]->(p:PricePoint)
+      WITH p
+      ORDER BY p.date DESC
+      LIMIT 1
+      RETURN p AS latestP
+    }
+    RETURN CASE
+      WHEN latestP IS NULL THEN null
+      ELSE toFloat(latestP.mean_price) END AS est
+    LIMIT 1
+    `,
+    { eid: elementId },
+    "estPriceByElement"
+  );
+  if (!result.records.length) return null;
+  return recordFloatOrNull(result.records[0].get("est"));
+}
+
+/**
+ * Orbit = top K games from the same `runSearchQuery` list (all match the query; order = search sort).
+ * Does not use getNeighbors.
+ * @param {SearchHit[]} hits
+ * @returns {import("../../shared/contracts.d.ts").GraphPayload}
+ */
+function graphFromSearchHits(hits) {
+  const capNeighbors = 30;
+  if (!hits.length) {
+    return { centerId: "", nodes: [], edges: [], neighborMode: "search_hits" };
+  }
+  const first = hits[0].game;
+  const centerId = first.id;
+  const nTotal = Math.min(hits.length, 1 + capNeighbors);
+  /** @type {import("../../shared/contracts.d.ts").GraphNode} */
+  const centerNode = {
+    ...first,
+    kind: "center",
+    queryResultRank: 1
+  };
+  /** @type {import("../../shared/contracts.d.ts").GraphNode[]} */
+  const nodes = [centerNode];
+  /** @type {import("../../shared/contracts.d.ts").GraphEdge[]} */
+  const edges = [];
+  for (let i = 1; i < nTotal; i += 1) {
+    const g = hits[i].game;
+    const rank1 = i + 1;
+    const k = i - 1;
+    const sim = 1.0 - k * 0.0001;
+    nodes.push({
+      ...g,
+      kind: "neighbor",
+      queryResultRank: rank1,
+      similarity: sim
+    });
+    edges.push({
+      id: `${centerId}->${g.id}`,
+      source: centerId,
+      target: g.id,
+      weight: sim
+    });
+  }
+  return {
+    centerId,
+    neighborMode: "search_hits",
+    nodes,
+    edges
+  };
 }
 
 /** @returns {Promise<GraphPayload>} */
 async function graphFromCenter(centerNode) {
-  const center = nodeToGame(centerNode);
+  const centerEst = await fetchEstPriceByElementId(centerNode.elementId);
+  const center = nodeToGame(centerNode, { estimatedPrice: centerEst });
   traceStep("graph", "0. graphFromCenter", { center: center.name, id: center.id, bggId: center.bggId });
   const neighborRows = await getNeighbors(center.id, 30);
-  const neighbors = neighborRows.map((row) => ({
-    ...nodeToGame(row.node),
-    similarity: row.similarity
-  }));
+  const neighbors = neighborRows.map((row) => {
+    const n = recordFloatOrNull(row.estPrice);
+    return {
+      ...nodeToGame(row.node, { estimatedPrice: n }),
+      similarity: row.similarity
+    };
+  });
 
   const payload = {
     centerId: center.id,
+    neighborMode: "similarity",
     nodes: [
       { ...center, kind: "center" },
       ...neighbors.map((neighbor) => ({ ...neighbor, kind: "neighbor" }))
@@ -310,7 +419,13 @@ function parseCriteria(body = {}) {
     maxTime: toNumber(filters.maxTime)
   };
   if (!criteria.keyword && message && message.length <= 80) {
-    criteria.keyword = message;
+    // Do not use whole NL as name CONTAINS; phrases like "Games like Brass" never match a node.
+    const similarityChat =
+      /\b(?:board\s*?)?games?\s+(?:like|similar to)\b/i.test(message) ||
+      (/^(?:find|show|recommend|give|search|looking for|i\s+want|get)\b/i.test(message) && /\b(like|similar to)\b/i.test(message));
+    if (!similarityChat) {
+      criteria.keyword = message;
+    }
   }
   if (criteria.players == null && message) {
     const playersMatch = message.match(/(\d+)\s*player/i);
@@ -364,23 +479,41 @@ app.get("/api/graph/node/:id", async (req, res) => {
   }
 });
 
+/** Center graph on game by BoardGameGeek id (prompt anchor / similarity reference). */
+app.get("/api/graph/bgg/:bggId", async (req, res) => {
+  try {
+    const raw = String(req.params.bggId ?? "").trim();
+    if (!raw) {
+      return res.status(400).json({ error: "Missing bgg_id." });
+    }
+    traceStep("route", "GET /api/graph/bgg/:bggId", { bggId: raw });
+    const result = await runQuery(
+      `MATCH (g:Game) WHERE toString(g.bgg_id) = $bgg RETURN g LIMIT 1`,
+      { bgg: raw },
+      "graphByBggId"
+    );
+    if (!result.records.length) {
+      return res.status(404).json({ error: "No game with this bgg_id." });
+    }
+    return res.json({ source: "bgg", bggId: raw, graph: await graphFromCenter(result.records[0].get("g")) });
+  } catch (error) {
+    return res.status(500).json({ error: error.message });
+  }
+});
+
 app.post("/api/search", async (req, res) => {
   traceStep("route", "POST /api/search: start");
   try {
-    const { query, includeGraph } = parseSearchRequest(req.body || {});
+    const { query, includeGraph, nlParse } = await parseSearchRequest(req.body || {});
     const { hits, spec } = await runSearchQuery(driver, NEO4J_DATABASE, runQuery, query, neo4j);
-    const payload = { query: spec, hits };
+    const payload = { query: spec, hits, nlParse: nlParse ?? null };
     if (includeGraph && hits.length) {
-      const firstId = hits[0].game.id;
-      traceStep("route", "POST /api/search: building graph for top hit", { firstId, name: hits[0].game.name });
-      const gr = await runQuery(
-        `MATCH (g:Game) WHERE elementId(g) = $id RETURN g LIMIT 1`,
-        { id: firstId },
-        "loadGameForGraph"
-      );
-      if (gr.records.length) {
-        payload.graph = await graphFromCenter(gr.records[0].get("g"));
-      }
+      traceStep("route", "POST /api/search: building graph from search hits", {
+        firstId: hits[0].game.id,
+        name: hits[0].game.name,
+        hitCount: hits.length
+      });
+      payload.graph = graphFromSearchHits(hits);
     }
     traceStep("route", "POST /api/search: 200", { hitCount: hits.length, includeGraph: Boolean(payload.graph) });
     return res.json(payload);
@@ -392,41 +525,37 @@ app.post("/api/search", async (req, res) => {
 
 app.post("/api/recommend", async (req, res) => {
   traceStep("route", "POST /api/recommend: start", { useSearchDefault: USE_SEARCH_DEFAULT });
+  /** @type {import("../../shared/contracts.d.ts").NlParseMeta | null | undefined} */
+  let nlParseRecommend = null;
   try {
     if (USE_SEARCH_DEFAULT) {
-      const q = bodyToQuerySpec(req.body || {}, (req.body || {}).filters);
+      const parsed = await bodyToQuerySpecAsync(req.body || {}, (req.body || {}).filters);
+      nlParseRecommend = parsed.nlParse ?? null;
+      const q = parsed.spec;
       traceStep("route", "POST /api/recommend: search path", { useSearchDefault: true });
       const { hits, spec: querySpec } = await runSearchQuery(driver, NEO4J_DATABASE, runQuery, q, neo4j);
       if (hits.length) {
-        const firstId = hits[0].game.id;
-        const gr = await runQuery(
-          `MATCH (g:Game) WHERE elementId(g) = $id RETURN g LIMIT 1`,
-          { id: firstId },
-          "loadGameForGraph"
-        );
-        if (gr.records.length) {
-          traceStep("route", "POST /api/recommend: 200 from search", {
-            topGame: hits[0].game.name,
-            hitCount: hits.length
-          });
-          return res.json({
-            source: "search",
-            fromSearch: true,
-            query: querySpec,
-            searchMeta: { query: querySpec, topHit: hits[0] },
-            criteria: {
-              keyword: querySpec.keyword || "",
-              players: querySpec.players ?? null,
-              maxTime: querySpec.maxTime ?? null,
-              maxPrice: querySpec.maxPrice ?? null,
-              minRating: querySpec.minRating ?? null,
-              preset: querySpec.preset ?? null,
-              sort: querySpec.sort
-            },
-            graph: await graphFromCenter(gr.records[0].get("g"))
-          });
-        }
-        traceStep("route", "POST /api/recommend: search had hits but load node failed, fallback");
+        traceStep("route", "POST /api/recommend: 200 from search", {
+          topGame: hits[0].game.name,
+          hitCount: hits.length
+        });
+        return res.json({
+          source: "search",
+          fromSearch: true,
+          query: querySpec,
+          searchMeta: { query: querySpec, topHit: hits[0] },
+          nlParse: nlParseRecommend ?? null,
+          criteria: {
+            keyword: querySpec.keyword || "",
+            players: querySpec.players ?? null,
+            maxTime: querySpec.maxTime ?? null,
+            maxPrice: querySpec.maxPrice ?? null,
+            minRating: querySpec.minRating ?? null,
+            preset: querySpec.preset ?? null,
+            sort: querySpec.sort
+          },
+          graph: graphFromSearchHits(hits)
+        });
       } else {
         traceStep("route", "POST /api/recommend: search returned 0 hits, fallback to pickCenter", {});
       }

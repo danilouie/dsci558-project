@@ -8,12 +8,36 @@ export interface GameSummary {
   minPlayers?: number | null;
   maxPlayers?: number | null;
   playTime?: number | null;
+  /** Primary display rating (typically Bayes / geek rating when present). */
   rating?: number | null;
   usersRated?: number | null;
   complexity?: number | null;
   similarity?: number;
   /** Present when item came from /api/search */
   searchExplain?: SearchExplain;
+
+  /** From graph ETL (BGG-style fields on :Game) */
+  geekRating?: number | null;
+  averageRating?: number | null;
+  numVoters?: number | null;
+  description?: string | null;
+  categories?: string[];
+  mechanisms?: string[];
+  minAge?: number | null;
+  minPlaytime?: number | null;
+  maxPlaytime?: number | null;
+  bestMinPlayers?: number | null;
+  bestMaxPlayers?: number | null;
+  isExpansion?: boolean | null;
+  /** Overall BGG rank when stored on the node */
+  rank?: number | null;
+  /** Latest :PricePoint mean_price (est. market price), when loaded from the graph */
+  estimatedPrice?: number | null;
+  /**
+   * When the graph is built from search `hits` (not profile similarity), 1-based index in
+   * the result list (center = 1). Omitted for browse / getNeighbors graphs.
+   */
+  queryResultRank?: number;
 }
 
 export interface GraphNode extends GameSummary {
@@ -31,6 +55,12 @@ export interface GraphPayload {
   centerId: string;
   nodes: GraphNode[];
   edges: GraphEdge[];
+  /**
+   * `search_hits` = orbit = top K games from the same `runSearchQuery` list (query-matched, query-ranked).
+   * `similarity` = legacy profile-similarity from getNeighbors (browse, click-by-id, default).
+   * @default undefined (treat as `similarity` for backward compatibility)
+   */
+  neighborMode?: "search_hits" | "similarity";
 }
 
 export type QueryPresetId =
@@ -60,6 +90,25 @@ export type SearchSortField =
   | "wants"
   | "wtt"
   | "price_drop";
+
+/** Parsed NL routing for hybrid Ollama + optional FAISS similarity. */
+export type PromptKind = "similar_to_game" | "filtering" | "both";
+
+/** Optional debug metadata when the backend used Ollama / FAISS for the message. */
+export interface NlParseMeta {
+  promptKind?: PromptKind | null;
+  /** Ollama | heuristic */
+  source?: "ollama" | "heuristic" | "mixed";
+  /** Anchor title resolved for similarity (if any) */
+  similarToGame?: string | null;
+  anchorBggId?: string | null;
+  /** When description FAISS constrained the candidate set */
+  faissSimilarity?: boolean;
+  /** Category description shard used for similarity (folder name under cat/), or omitted when all_games */
+  faissCategorySlug?: string | null;
+  /** Which embedding index served similar-by-description */
+  faissIndex?: "all_games" | "category" | null;
+}
 
 export interface QuerySpec {
   keyword?: string | null;
@@ -93,6 +142,11 @@ export interface QuerySpec {
   sortDirection?: "asc" | "desc";
   limit?: number;
   preset?: QueryPresetId | null;
+  /**
+   * When set (non-empty), restrict search to these BGG ids (semantic similarity pipeline).
+   * Omit or empty = no restriction.
+   */
+  bggIdAllowList?: string[] | null;
 }
 
 export interface SearchExplain {
@@ -152,6 +206,7 @@ export interface SearchApiResponse {
   query: QuerySpec;
   hits: SearchHit[];
   graph?: GraphPayload;
+  nlParse?: NlParseMeta | null;
 }
 
 export interface RecommendCriteria {
@@ -191,6 +246,7 @@ export interface GraphApiResponse {
   query?: QuerySpec;
   /** Explain / ranking context for the centered game */
   searchMeta?: SearchMeta | null;
+  nlParse?: NlParseMeta | null;
 }
 
 export interface ApiErrorResponse {
