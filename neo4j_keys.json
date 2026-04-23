@@ -1,0 +1,107 @@
+[
+  {
+    "label": "BggReview",
+    "properties": [
+      "sources",
+      "game_name_raw",
+      "source_review_keys",
+      "page",
+      "username",
+      "bgg_review_id",
+      "comment_text",
+      "rating"
+    ]
+  },
+  {
+    "label": "Game",
+    "properties": [
+      "average",
+      "usersrated",
+      "rank_id",
+      "id",
+      "yearpublished",
+      "categories",
+      "rank_value",
+      "bayesaverage",
+      "pred_avg_quality",
+      "complexity",
+      "geek_rating",
+      "min_players",
+      "max_playtime",
+      "max_players",
+      "description",
+      "min_age",
+      "is_expansion",
+      "min_of_min",
+      "avg_rating",
+      "max_of_max",
+      "best_max_players",
+      "best_min_players",
+      "mechanisms",
+      "min_playtime",
+      "year",
+      "rank",
+      "num_voters",
+      "mean_of_mean",
+      "strategygames_rank",
+      "bgg_id",
+      "name",
+      "thematic_rank",
+      "wargames_rank",
+      "familygames_rank",
+      "cgs_rank",
+      "abstracts_rank",
+      "partygames_rank",
+      "childrensgames_rank"
+    ]
+  },
+  {
+    "label": "PricePoint",
+    "properties": [
+      "date",
+      "max_price",
+      "source",
+      "price_point_id",
+      "mean_price",
+      "max",
+      "min_price",
+      "min",
+      "mean",
+      "dt",
+      "bgg_id",
+      "pt_id"
+    ]
+  },
+  {
+    "label": "Review",
+    "properties": [
+      "category",
+      "score",
+      "hits",
+      "published_at",
+      "gameplay_overview",
+      "intro",
+      "review_id",
+      "url",
+      "score_raw",
+      "author_url",
+      "bgg_id",
+      "game_name",
+      "published_date",
+      "game_name_raw",
+      "game_experience",
+      "final_score_description",
+      "author",
+      "body",
+      "final_thoughts",
+      "title",
+      "misses"
+    ]
+  },
+  {
+    "label": "User",
+    "properties": [
+      "username"
+    ]
+  }
+]

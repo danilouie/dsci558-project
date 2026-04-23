@@ -1,29 +1,66 @@
 /**
- * NL → QuerySpec: Ollama (classify + filter A + filter B + reconcile), optional FAISS similarity.
+ * NL → QuerySpec: single Ollama planner + optional FAISS similarity.
  */
 import {
-  classifyPromptKind,
-  filterStepActiveKinds,
-  filterStepExtractValues,
-  sanitizeQuerySpec,
-  selectFaissCategorySlug,
-  reconcileQuerySpecFromMessage
+  planBoardGameQuery,
+  plannerFiltersToQuerySpec,
+  plannerResponseToQuerySpec,
+  sanitizeQuerySpec
 } from "./ollamaNlp.js";
-import {
-  faissResolveName,
-  faissSimilarByDescription,
-  faissListCategorySlugs
-} from "./faissClient.js";
+import { faissResolveName, faissSimilarByDescription } from "./faissClient.js";
 import { mergeQuerySpec, messageToQuerySpec } from "./searchQuery.js";
 import { traceStep } from "./trace.js";
 
 /** @typedef {import("../../shared/contracts.d.ts").QuerySpec} QuerySpec */
 /** @typedef {import("../../shared/contracts.d.ts").NlParseMeta} NlParseMeta */
 /** @typedef {import("../../shared/contracts.d.ts").QueryPresetId} QueryPresetId */
+/** @typedef {import("../../shared/contracts.d.ts").PlannerIntent} PlannerIntent */
+
+/**
+ * Default sort for ridge undervalued/overpriced when the planner did not set sort and
+ * preset does not already imply ordering (e.g. frequently_traded → wtt).
+ * @param {Partial<QuerySpec>} partial
+ */
+function applyPlannerRidgeDefaults(partial) {
+  if (partial.sort != null) return;
+  const preset = partial.preset ?? null;
+  if (preset === "frequently_traded" || preset === "undervalued" || preset === "overpriced") {
+    return;
+  }
+  if (partial.undervaluedOnly && !partial.overpricedOnly) {
+    partial.sort = "pred_avg_quality";
+    partial.sortDirection = partial.sortDirection || "desc";
+  } else if (partial.overpricedOnly) {
+    partial.sort = "pred_avg_quality";
+    partial.sortDirection = partial.sortDirection || "asc";
+  }
+}
 
 export const USE_OLLAMA_NL = (process.env.USE_OLLAMA_NL || "false") === "true";
 const USE_FAISS_SIMILAR = (process.env.USE_FAISS_SIMILAR || "false") === "true";
 const FAISS_TOP_K = Math.min(500, Math.max(5, Number(process.env.FAISS_TOP_K || 80)));
+
+/**
+ * Map planner intent → legacy PromptKind for clients that still branch on old strings.
+ * @param {PlannerIntent} intent
+ */
+function intentToLegacyPromptKind(intent) {
+  if (intent === "filter") return "filtering";
+  if (intent === "similarity") return "similar_to_game";
+  return "both";
+}
+
+/**
+ * HTTP `filters` object → partial QuerySpec (same keys).
+ * @param {import("../../shared/contracts.d.ts").GameFiltersPayload | Record<string, unknown> | null | undefined} f
+ * @returns {Partial<QuerySpec>}
+ */
+export function filtersFromRequestBody(f) {
+  if (!f || typeof f !== "object") return {};
+  /** @type {Partial<QuerySpec>} */
+  const raw = { ...f };
+  return sanitizeQuerySpec(raw);
+}
 
 /**
  * @param {(cypher: string, params: object, label?: string) => Promise<import("neo4j-driver").Result>} runQuery
@@ -49,23 +86,6 @@ async function fetchGameDescription(runQuery, bggId) {
 }
 
 /**
- * Merge explicit UI filters (same shape as bodyToQuerySpec).
- * @param {import("../../shared/contracts.d.ts").RecommendRequestBody["filters"] | Record<string, unknown>} f
- */
-function explicitFiltersToPartial(f) {
-  const fl = f || {};
-  return {
-    keyword: fl.keyword != null && fl.keyword !== "" ? String(fl.keyword) : undefined,
-    players: fl.players != null ? Number(fl.players) : undefined,
-    maxTime: fl.maxTime != null ? Number(fl.maxTime) : undefined,
-    maxPrice: fl.maxPrice != null ? Number(fl.maxPrice) : undefined,
-    minRating: fl.minRating != null ? Number(fl.minRating) : undefined,
-    sort: fl.sort,
-    preset: fl.preset ?? undefined
-  };
-}
-
-/**
  * @param {{ message: string, runQuery: (cypher: string, params: object, label?: string) => Promise<import("neo4j-driver").Result> }} args
  * @returns {Promise<{ partial: Partial<QuerySpec>, nlParse: NlParseMeta | null }>}
  */
@@ -82,119 +102,78 @@ export async function parseNaturalLanguageMessage(args) {
   const nlParse = { source: "ollama" };
 
   try {
-    const route = await classifyPromptKind(message);
-    nlParse.promptKind = route.promptKind;
-    nlParse.similarToGame = route.similarToGame;
+    const plan = await planBoardGameQuery(message);
+    nlParse.plannerIntent = plan.intent;
+    nlParse.promptKind = intentToLegacyPromptKind(plan.intent);
+    nlParse.plannerExplanation = plan.explanation || null;
+    nlParse.similarToGame = plan.similarity_target;
+    nlParse.faissIndex = "all_games";
 
+    const fromFilters =
+      plan.intent === "filter" || plan.intent === "hybrid" ? plannerFiltersToQuerySpec(plan.filters) : {};
+    const fromTop = plannerResponseToQuerySpec(plan);
     /** @type {Partial<QuerySpec>} */
-    let partial = {};
+    let partial = sanitizeQuerySpec({
+      ...fromFilters,
+      ...fromTop,
+      limit: plan.result_limit
+    });
+    applyPlannerRidgeDefaults(partial);
 
-    // Only "filtering" and "both" use filter A/B/reconcile. Pure "similar_to_game" (e.g. "Games like
-    // Brass Birmingham") has no table filters; running those steps invented keyword/preset and
-    // broke the FAISS + search allow-list path.
-    const needsFilterExtract = route.promptKind === "filtering" || route.promptKind === "both";
-
-    if (needsFilterExtract) {
-      const active = await filterStepActiveKinds(message);
-      const rawPartial = await filterStepExtractValues(message, active);
-      const merged = sanitizeQuerySpec(rawPartial);
-      const reconciled = await reconcileQuerySpecFromMessage(message, merged);
-      partial = { ...merged, ...reconciled };
-    }
-
-    if (route.promptKind === "filtering") {
+    if (plan.intent === "filter") {
       return { partial, nlParse };
     }
 
-    const needsSimilar = route.promptKind === "similar_to_game" || route.promptKind === "both";
+    const needsSimilar = plan.intent === "similarity" || plan.intent === "hybrid";
+    const phrase = plan.similarity_target;
 
-    /** @type {string | null} */
-    let faissCategorySlug = null;
-
-    if (needsSimilar && USE_FAISS_SIMILAR) {
+    if (needsSimilar && phrase && USE_FAISS_SIMILAR) {
       try {
-        const categorySlugAllowlist = await faissListCategorySlugs();
-        faissCategorySlug = await selectFaissCategorySlug(message, categorySlugAllowlist);
-        nlParse.faissCategorySlug = faissCategorySlug ?? null;
-        nlParse.faissIndex = faissCategorySlug ? "category" : "all_games";
-      } catch (slugErr) {
-        traceStep("nlQuery", "category slug list / selection skipped (non-fatal)", {
-          message: /** @type {Error} */ (slugErr).message
+        const resolved = await faissResolveName(phrase, 5);
+        const top = resolved?.results?.[0];
+        if (top && top.bgg_id != null) {
+          const anchorBggId = String(top.bgg_id);
+          nlParse.anchorBggId = anchorBggId;
+          const { description, name } = await fetchGameDescription(args.runQuery, anchorBggId);
+          const text = description && description.trim().length > 0 ? description : name;
+          if (text && text.trim()) {
+            const simParams = {
+              text,
+              top_k: FAISS_TOP_K,
+              exclude_bgg_id: anchorBggId,
+              category_slug: null
+            };
+            const sim = await faissSimilarByDescription(simParams);
+            if (sim?.index_used === "category") {
+              nlParse.faissIndex = "category";
+            } else if (sim?.index_used === "all_games") {
+              nlParse.faissIndex = "all_games";
+            }
+            const ids = (sim?.bgg_ids || []).map((x) => String(x));
+            if (ids.length) {
+              partial.bggIdAllowList = ids;
+              nlParse.faissSimilarity = true;
+            }
+          }
+        }
+      } catch (e) {
+        traceStep("nlQuery", "FAISS similarity failed (non-fatal)", {
+          message: /** @type {Error} */ (e).message
         });
-        nlParse.faissIndex = "all_games";
       }
     }
 
-    if (needsSimilar) {
-      const phrase = route.similarToGame;
-      if (!phrase || !phrase.trim()) {
-        traceStep("nlQuery", "similar leg: missing similarToGame after route");
-      } else if (USE_FAISS_SIMILAR) {
-        try {
-          const resolved = await faissResolveName(phrase, 5);
-          const top = resolved?.results?.[0];
-          if (top && top.bgg_id != null) {
-            const anchorBggId = String(top.bgg_id);
-            nlParse.anchorBggId = anchorBggId;
-            const { description, name } = await fetchGameDescription(args.runQuery, anchorBggId);
-            const text = description && description.trim().length > 0 ? description : name;
-            if (text && text.trim()) {
-              /** @type {Record<string, unknown>} */
-              const simParams = {
-                text,
-                top_k: FAISS_TOP_K,
-                exclude_bgg_id: anchorBggId,
-                category_slug: faissCategorySlug
-              };
-              let sim;
-              try {
-                sim = await faissSimilarByDescription(simParams);
-              } catch (shardErr) {
-                if (faissCategorySlug) {
-                  traceStep("nlQuery", "FAISS category shard failed; retry all_games", {
-                    message: /** @type {Error} */ (shardErr).message
-                  });
-                  nlParse.faissCategorySlug = null;
-                  nlParse.faissIndex = "all_games";
-                  sim = await faissSimilarByDescription({
-                    ...simParams,
-                    category_slug: null
-                  });
-                } else {
-                  throw shardErr;
-                }
-              }
-              if (sim?.index_used === "category") {
-                nlParse.faissIndex = "category";
-              } else if (sim?.index_used === "all_games") {
-                nlParse.faissIndex = "all_games";
-              }
-              const ids = (sim?.bgg_ids || []).map((x) => String(x));
-              if (ids.length) {
-                partial.bggIdAllowList = ids;
-                nlParse.faissSimilarity = true;
-              }
-            }
-          }
-        } catch (e) {
-          traceStep("nlQuery", "FAISS similarity failed (non-fatal)", {
-            message: /** @type {Error} */ (e).message
-          });
-        }
-      }
-
-      const hasAllow = Boolean(partial.bggIdAllowList?.length);
-      const anchorPhrase = route.similarToGame?.trim() || "";
-      if (hasAllow) {
-        partial.keyword = null;
-      } else if (anchorPhrase) {
-        partial.keyword = anchorPhrase;
-      }
+    const hasAllow = Boolean(partial.bggIdAllowList?.length);
+    const anchorPhrase = phrase?.trim() || "";
+    if (hasAllow) {
+      partial.keyword = null;
+    } else if (anchorPhrase) {
+      partial.keyword = anchorPhrase;
     }
 
     return { partial, nlParse };
   } catch (err) {
-    traceStep("nlQuery", "Ollama NL failed; keyword-only fallback (no Ollama)", {
+    traceStep("nlQuery", "Ollama planner failed; keyword-only fallback", {
       message: /** @type {Error} */ (err).message
     });
     return {
@@ -207,19 +186,16 @@ export async function parseNaturalLanguageMessage(args) {
 /**
  * @param {object} args
  * @param {string} args.message
- * @param {import("../../shared/contracts.d.ts").RecommendRequestBody["filters"]} [args.filters]
+ * @param {import("../../shared/contracts.d.ts").GameFiltersPayload} [args.filters]
  * @param {number} [args.limit]
  * @param {(cypher: string, params: object, label?: string) => Promise<import("neo4j-driver").Result>} args.runQuery
  */
 export async function buildQuerySpecFromNaturalLanguage(args) {
   const message = String(args.message || "").trim();
   const filters = args.filters || {};
-  /** When the user is asking in natural language, the spec must come from the text (Ollama / keyword), not from filter-bar defaults. */
   const hasMessage = Boolean(message);
-  const baseFilters = hasMessage ? {} : explicitFiltersToPartial(filters);
-  const presetFromUi = hasMessage
-    ? undefined
-    : /** @type {QueryPresetId | null | undefined} */ (filters.preset ?? null);
+  const baseFilters = hasMessage ? {} : filtersFromRequestBody(filters);
+  const presetFromUi = hasMessage ? undefined : /** @type {QueryPresetId | null | undefined} */ (filters.preset ?? null);
 
   if (!USE_OLLAMA_NL || !message) {
     const fromMsg = messageToQuerySpec(message);

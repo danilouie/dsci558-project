@@ -1,6 +1,7 @@
 import { CSSProperties, FormEvent, PointerEvent as ReactPointerEvent, useEffect, useMemo, useRef, useState } from "react";
 import type {
   ApiErrorResponse,
+  GameFiltersPayload,
   GameSummary,
   GraphApiResponse,
   GraphNode,
@@ -11,15 +12,35 @@ import type {
   SearchMeta,
   SearchSortField
 } from "../../shared/contracts";
+import categoryVocab from "../../shared/categories.json";
+import mechanismVocab from "../../shared/mechanics.json";
 
 const API_URL = import.meta.env.VITE_API_URL || "http://localhost:4000";
 
+const CATEGORY_OPTIONS: string[] = categoryVocab;
+const MECHANISM_OPTIONS: string[] = mechanismVocab;
+
 interface RecommendFilters {
   keyword: string;
+  /** Games that support this many people at the table */
   players: string;
+  filterMinPlayers: string;
+  filterMaxPlayers: string;
+  minPlaytime: string;
   maxTime: string;
+  minPrice: string;
   maxPrice: string;
   minRating: string;
+  minYear: string;
+  maxYear: string;
+  maxMinAge: string;
+  minComplexity: string;
+  maxComplexity: string;
+  minPredAvgQuality: string;
+  maxPredAvgQuality: string;
+  isExpansion: "any" | "yes" | "no";
+  selectedCategories: string[];
+  selectedMechanisms: string[];
   preset: string;
   sort: SearchSortField | "";
 }
@@ -107,9 +128,23 @@ function buildDemoGraph(centerId = demoCatalog[0].id): GraphPayload {
 const defaultFilters: RecommendFilters = {
   keyword: "",
   players: "",
+  filterMinPlayers: "",
+  filterMaxPlayers: "",
+  minPlaytime: "",
   maxTime: "",
+  minPrice: "",
   maxPrice: "",
   minRating: "",
+  minYear: "",
+  maxYear: "",
+  maxMinAge: "",
+  minComplexity: "",
+  maxComplexity: "",
+  minPredAvgQuality: "",
+  maxPredAvgQuality: "",
+  isExpansion: "any",
+  selectedCategories: [],
+  selectedMechanisms: [],
   preset: "",
   sort: ""
 };
@@ -134,20 +169,68 @@ const SORT_OPTIONS: { value: SearchSortField; label: string }[] = [
   { value: "want_minus_own", label: "Wants minus owns" },
   { value: "wtt", label: "Want-to-trade count" },
   { value: "wants", label: "Want count" },
-  { value: "value_score", label: "Value score (on graph)" },
-  { value: "price_drop", label: "Price drop vs window" }
+  { value: "pred_avg_quality", label: "Predicted quality (ridge)" },
+  { value: "price_drop", label: "Price drop vs window (not in use)" }
 ];
 
-function toRequestFilters(filters: RecommendFilters): RecommendRequestBody["filters"] {
-  return {
-    keyword: filters.keyword || undefined,
-    players: filters.players ? Number(filters.players) : null,
-    maxTime: filters.maxTime ? Number(filters.maxTime) : null,
-    maxPrice: filters.maxPrice ? Number(filters.maxPrice) : null,
-    minRating: filters.minRating ? Number(filters.minRating) : null,
-    preset: (filters.preset as QueryPresetId) || null,
-    sort: filters.sort || undefined
-  };
+function parseNum(s: string): number | undefined {
+  const t = s.trim();
+  if (!t) return undefined;
+  const n = Number(t);
+  return Number.isFinite(n) ? n : undefined;
+}
+
+function toggleStringInSet(list: string[], value: string, add: boolean): string[] {
+  if (add) {
+    return list.includes(value) ? list : [...list, value];
+  }
+  return list.filter((x) => x !== value);
+}
+
+function toRequestFilters(filters: RecommendFilters): GameFiltersPayload {
+  const out: GameFiltersPayload = {};
+  if (filters.keyword.trim()) out.keyword = filters.keyword.trim();
+  const seat = parseNum(filters.players);
+  if (seat !== undefined) out.supportsPlayerCount = seat;
+  const pfMin = parseNum(filters.filterMinPlayers);
+  const pfMax = parseNum(filters.filterMaxPlayers);
+  if (pfMin !== undefined) out.filterMinPlayers = pfMin;
+  if (pfMax !== undefined) out.filterMaxPlayers = pfMax;
+  const maxT = parseNum(filters.maxTime);
+  if (maxT !== undefined) out.maxTime = maxT;
+  const minPt = parseNum(filters.minPlaytime);
+  if (minPt !== undefined) out.minPlaytime = minPt;
+  const minP = parseNum(filters.minPrice);
+  if (minP !== undefined) out.minPrice = minP;
+  const maxP = parseNum(filters.maxPrice);
+  if (maxP !== undefined) out.maxPrice = maxP;
+  const minR = parseNum(filters.minRating);
+  if (minR !== undefined) out.minRating = minR;
+  const y0 = parseNum(filters.minYear);
+  const y1 = parseNum(filters.maxYear);
+  if (y0 !== undefined) out.minYear = Math.round(y0);
+  if (y1 !== undefined) out.maxYear = Math.round(y1);
+  const age = parseNum(filters.maxMinAge);
+  if (age !== undefined) out.maxMinAge = Math.round(age);
+  const mic = parseNum(filters.minComplexity);
+  const mac = parseNum(filters.maxComplexity);
+  if (mic !== undefined) out.minComplexity = mic;
+  if (mac !== undefined) out.maxComplexity = mac;
+  const minPq = parseNum(filters.minPredAvgQuality);
+  const maxPq = parseNum(filters.maxPredAvgQuality);
+  if (minPq !== undefined) out.minPredAvgQuality = minPq;
+  if (maxPq !== undefined) out.maxPredAvgQuality = maxPq;
+  if (filters.isExpansion === "yes") out.isExpansion = true;
+  else if (filters.isExpansion === "no") out.isExpansion = false;
+  if (filters.selectedCategories.length > 0) {
+    out.categoryContains = filters.selectedCategories.map((c) => c.toLowerCase().trim());
+  }
+  if (filters.selectedMechanisms.length > 0) {
+    out.mechanismContains = filters.selectedMechanisms.map((c) => c.toLowerCase().trim());
+  }
+  if (filters.preset) out.preset = filters.preset as QueryPresetId;
+  if (filters.sort) out.sort = filters.sort;
+  return out;
 }
 
 function formatStat(value: string | number | null | undefined, suffix = ""): string {
@@ -176,6 +259,11 @@ function formatEstPrice(g: GameSummary): string {
   const p = g.searchExplain?.meanPrice ?? g.estimatedPrice;
   if (p == null || !Number.isFinite(p)) return "—";
   return `$${p.toFixed(2)}`;
+}
+
+function formatRidgeMetric(value: number | null | undefined, decimals = 4): string {
+  if (value == null || !Number.isFinite(value)) return "—";
+  return value.toFixed(decimals);
 }
 
 /** Latest mean price for display: search explain, then graph est. (same as formatEstPrice, number). */
@@ -983,6 +1071,32 @@ function App() {
                   </dl>
                 </div>
 
+                <div className="info-section">
+                  <h3>Value model (ridge)</h3>
+                  <p className="panel-context-line">
+                    Stored on <code>:Game</code> when the graph includes ridge outputs (e.g.{" "}
+                    <code>pred_avg_quality</code>, <code>mean_of_mean</code>, …).
+                  </p>
+                  <dl className="detail-dl-rich">
+                    <div>
+                      <dt>pred_avg_quality</dt>
+                      <dd>{formatRidgeMetric(selectedGame.predAvgQuality)}</dd>
+                    </div>
+                    <div>
+                      <dt>mean_of_mean</dt>
+                      <dd>{formatRidgeMetric(selectedGame.meanOfMean)}</dd>
+                    </div>
+                    <div>
+                      <dt>max_of_max</dt>
+                      <dd>{formatRidgeMetric(selectedGame.maxOfMax)}</dd>
+                    </div>
+                    <div>
+                      <dt>min_of_min</dt>
+                      <dd>{formatRidgeMetric(selectedGame.minOfMin)}</dd>
+                    </div>
+                  </dl>
+                </div>
+
                 {(selectedGame.categories?.length ?? 0) > 0 ? (
                   <div className="info-section">
                     <h3>Categories</h3>
@@ -1070,9 +1184,10 @@ function App() {
             </button>
           </div>
 
+          <div className="drawer-scroll">
           <form className="filter-grid" onSubmit={handleFilterSubmit}>
             <label>
-              Keyword
+              Keyword (name contains)
               <input
                 value={filters.keyword}
                 onChange={(event) => setFilters((current) => ({ ...current, keyword: event.target.value }))}
@@ -1080,21 +1195,56 @@ function App() {
               />
             </label>
             <label>
-              Players
+              Players at table
               <input
                 value={filters.players}
                 onChange={(event) => setFilters((current) => ({ ...current, players: event.target.value }))}
                 inputMode="numeric"
-                placeholder="4"
+                placeholder="e.g. 4 — game must allow this count"
               />
             </label>
             <label>
-              Max time (min)
+              Player range (min)
+              <input
+                value={filters.filterMinPlayers}
+                onChange={(event) => setFilters((current) => ({ ...current, filterMinPlayers: event.target.value }))}
+                inputMode="numeric"
+                placeholder="overlap lower"
+              />
+            </label>
+            <label>
+              Player range (max)
+              <input
+                value={filters.filterMaxPlayers}
+                onChange={(event) => setFilters((current) => ({ ...current, filterMaxPlayers: event.target.value }))}
+                inputMode="numeric"
+                placeholder="overlap upper"
+              />
+            </label>
+            <label>
+              Min session length (min)
+              <input
+                value={filters.minPlaytime}
+                onChange={(event) => setFilters((current) => ({ ...current, minPlaytime: event.target.value }))}
+                inputMode="numeric"
+                placeholder="60"
+              />
+            </label>
+            <label>
+              Max session length (min)
               <input
                 value={filters.maxTime}
                 onChange={(event) => setFilters((current) => ({ ...current, maxTime: event.target.value }))}
                 inputMode="numeric"
                 placeholder="90"
+              />
+            </label>
+            <label>
+              Min price ($)
+              <input
+                value={filters.minPrice}
+                onChange={(event) => setFilters((current) => ({ ...current, minPrice: event.target.value }))}
+                inputMode="decimal"
               />
             </label>
             <label>
@@ -1107,13 +1257,88 @@ function App() {
               />
             </label>
             <label>
-              Min rating
+              Min geek rating
               <input
                 value={filters.minRating}
                 onChange={(event) => setFilters((current) => ({ ...current, minRating: event.target.value }))}
                 inputMode="decimal"
                 placeholder="7.0"
               />
+            </label>
+            <label>
+              Year from
+              <input
+                value={filters.minYear}
+                onChange={(event) => setFilters((current) => ({ ...current, minYear: event.target.value }))}
+                inputMode="numeric"
+              />
+            </label>
+            <label>
+              Year to
+              <input
+                value={filters.maxYear}
+                onChange={(event) => setFilters((current) => ({ ...current, maxYear: event.target.value }))}
+                inputMode="numeric"
+              />
+            </label>
+            <label>
+              Max box min-age (≤)
+              <input
+                value={filters.maxMinAge}
+                onChange={(event) => setFilters((current) => ({ ...current, maxMinAge: event.target.value }))}
+                inputMode="numeric"
+                placeholder="Family-friendly ceiling"
+              />
+            </label>
+            <label>
+              Min complexity
+              <input
+                value={filters.minComplexity}
+                onChange={(event) => setFilters((current) => ({ ...current, minComplexity: event.target.value }))}
+                inputMode="decimal"
+              />
+            </label>
+            <label>
+              Max complexity
+              <input
+                value={filters.maxComplexity}
+                onChange={(event) => setFilters((current) => ({ ...current, maxComplexity: event.target.value }))}
+                inputMode="decimal"
+              />
+            </label>
+            <label>
+              Min pred. quality (ridge)
+              <input
+                value={filters.minPredAvgQuality}
+                onChange={(event) => setFilters((current) => ({ ...current, minPredAvgQuality: event.target.value }))}
+                inputMode="decimal"
+                placeholder="pred_avg_quality ≥"
+              />
+            </label>
+            <label>
+              Max pred. quality (ridge)
+              <input
+                value={filters.maxPredAvgQuality}
+                onChange={(event) => setFilters((current) => ({ ...current, maxPredAvgQuality: event.target.value }))}
+                inputMode="decimal"
+                placeholder="pred_avg_quality ≤"
+              />
+            </label>
+            <label>
+              Expansion
+              <select
+                value={filters.isExpansion}
+                onChange={(event) =>
+                  setFilters((current) => ({
+                    ...current,
+                    isExpansion: event.target.value as RecommendFilters["isExpansion"]
+                  }))
+                }
+              >
+                <option value="any">Any</option>
+                <option value="yes">Expansion only</option>
+                <option value="no">Exclude expansions</option>
+              </select>
             </label>
             <label>
               Sort by
@@ -1131,6 +1356,46 @@ function App() {
                 ))}
               </select>
             </label>
+            <div className="multi-select-block">
+              <span className="chips-label">Categories (leave empty for all)</span>
+              <div className="multi-select-scroll">
+                {CATEGORY_OPTIONS.map((cat) => (
+                  <label key={cat} className="multi-check">
+                    <input
+                      type="checkbox"
+                      checked={filters.selectedCategories.includes(cat)}
+                      onChange={(e) =>
+                        setFilters((cur) => ({
+                          ...cur,
+                          selectedCategories: toggleStringInSet(cur.selectedCategories, cat, e.target.checked)
+                        }))
+                      }
+                    />{" "}
+                    {cat}
+                  </label>
+                ))}
+              </div>
+            </div>
+            <div className="multi-select-block">
+              <span className="chips-label">Mechanisms (leave empty for all)</span>
+              <div className="multi-select-scroll">
+                {MECHANISM_OPTIONS.map((mech) => (
+                  <label key={mech} className="multi-check">
+                    <input
+                      type="checkbox"
+                      checked={filters.selectedMechanisms.includes(mech)}
+                      onChange={(e) =>
+                        setFilters((cur) => ({
+                          ...cur,
+                          selectedMechanisms: toggleStringInSet(cur.selectedMechanisms, mech, e.target.checked)
+                        }))
+                      }
+                    />{" "}
+                    {mech}
+                  </label>
+                ))}
+              </div>
+            </div>
             <div className="preset-chips">
               <p className="chips-label">Presets</p>
               <div className="chip-row">
@@ -1157,6 +1422,7 @@ function App() {
           <div className="panel-note">
             <p>{status}</p>
             {error ? <p className="error-text">{error}</p> : null}
+          </div>
           </div>
         </aside>
 

@@ -33,6 +33,12 @@ export interface GameSummary {
   rank?: number | null;
   /** Latest :PricePoint mean_price (est. market price), when loaded from the graph */
   estimatedPrice?: number | null;
+  /** Ridge pipeline predicted average quality (`pred_avg_quality` on :Game) */
+  predAvgQuality?: number | null;
+  /** Ridge summary stats on :Game when present */
+  meanOfMean?: number | null;
+  maxOfMax?: number | null;
+  minOfMin?: number | null;
   /**
    * When the graph is built from search `hits` (not profile similarity), 1-based index in
    * the result list (center = 1). Omitted for browse / getNeighbors graphs.
@@ -76,7 +82,7 @@ export type QueryPresetId =
 
 /**
  * How to order results. `rank_value_asc` = best BGG rank (lower number first).
- * `value_score` uses a numeric property on :Game when present; otherwise ignored in ORDER BY.
+ * `value_score` is an alias for sorting by ridge `pred_avg_quality` on `GameSummary`.
  */
 export type SearchSortField =
   | "rating"
@@ -89,14 +95,20 @@ export type SearchSortField =
   | "value_score"
   | "wants"
   | "wtt"
-  | "price_drop";
+  | "price_drop"
+  | "pred_avg_quality";
 
-/** Parsed NL routing for hybrid Ollama + optional FAISS similarity. */
-export type PromptKind = "similar_to_game" | "filtering" | "both";
+/** Chat planner intent (Llama JSON); aliases for legacy PromptKind below. */
+export type PlannerIntent = "filter" | "similarity" | "hybrid";
+
+/** @deprecated use PlannerIntent — kept for older responses */
+export type PromptKind = PlannerIntent | "similar_to_game" | "filtering" | "both";
 
 /** Optional debug metadata when the backend used Ollama / FAISS for the message. */
 export interface NlParseMeta {
   promptKind?: PromptKind | null;
+  /** Preferred: same as planner `intent` */
+  plannerIntent?: PlannerIntent | null;
   /** Ollama | heuristic */
   source?: "ollama" | "heuristic" | "mixed";
   /** Anchor title resolved for similarity (if any) */
@@ -104,34 +116,86 @@ export interface NlParseMeta {
   anchorBggId?: string | null;
   /** When description FAISS constrained the candidate set */
   faissSimilarity?: boolean;
-  /** Category description shard used for similarity (folder name under cat/), or omitted when all_games */
-  faissCategorySlug?: string | null;
   /** Which embedding index served similar-by-description */
   faissIndex?: "all_games" | "category" | null;
+  /** Single planner turn — short model rationale (not used for querying) */
+  plannerExplanation?: string | null;
+}
+
+/** Nested object returned by the board-game query planner (Ollama JSON). */
+export interface PlannerFiltersPayload {
+  min_players?: number | null;
+  max_players?: number | null;
+  min_playtime?: number | null;
+  max_playtime?: number | null;
+  max_complexity?: number | null;
+  min_complexity?: number | null;
+  categories?: string[] | null;
+  mechanisms?: string[] | null;
+  min_avg_rating?: number | null;
+  max_price?: number | null;
+  year_from?: number | null;
+  year_to?: number | null;
+  max_min_age?: number | null;
+  is_expansion?: boolean | null;
+}
+
+/** Full JSON response from the single-shot planner (snake_case matches Ollama JSON). */
+export interface PlannerResponse {
+  intent: PlannerIntent;
+  similarity_target: string | null;
+  filters: PlannerFiltersPayload;
+  result_limit: number;
+  explanation: string;
+  /** Optional UI preset id — same strings as `QueryPresetId`. */
+  preset?: QueryPresetId | null;
+  /**
+   * Ridge “undervalued” — high `pred_avg_quality` on `:Game`, not BGG `min_avg_rating`.
+   * Pair with `sort` / preset or defaults to `pred_avg_quality` desc in NL merge.
+   */
+  undervalued_only?: boolean;
+  /** Ridge “overpriced” — low `pred_avg_quality`; defaults to sort asc when unset. */
+  overpriced_only?: boolean;
+  sort?: SearchSortField | null;
+  sort_direction?: "asc" | "desc" | null;
 }
 
 export interface QuerySpec {
   keyword?: string | null;
+  /** Legacy: games that support at least this many players at the table (min_players <= players). Prefer supportsPlayerCount. */
   players?: number | null;
+  /** Games that accommodate exactly this player count (min <= N <= max on :Game). */
+  supportsPlayerCount?: number | null;
+  /** Overlap filter: game player range intersects [filterMinPlayers, filterMaxPlayers]. */
+  filterMinPlayers?: number | null;
+  filterMaxPlayers?: number | null;
   maxTime?: number | null;
+  /** Minimum listed playtime (minutes), lower bound on sessions */
+  minPlaytime?: number | null;
   maxPrice?: number | null;
   minPrice?: number | null;
   minRating?: number | null;
-  /** Substrings (case-insensitive) matched against :Game categories list */
+  /** Exact-normalized labels (lower case) matched with IN against category strings */
   categoryContains?: string[];
-  /** Substrings (case-insensitive) against mechanisms list */
   mechanismContains?: string[];
   minComplexity?: number | null;
   maxComplexity?: number | null;
+  minYear?: number | null;
+  maxYear?: number | null;
+  /** Games with box min age <= this value (family-friendly ceiling) */
+  maxMinAge?: number | null;
+  /** When true/false, restrict expansions; null = no filter */
+  isExpansion?: boolean | null;
+  /** Filter games with ridge `pred_avg_quality` in range (games without the property excluded when bound is set) */
+  minPredAvgQuality?: number | null;
+  maxPredAvgQuality?: number | null;
   minWants?: number | null;
   minOwns?: number | null;
   undervaluedOnly?: boolean;
   overpricedOnly?: boolean;
-  /**
-   * When set with undervaluedOnly/overpricedOnly and no model flags, require
-   * rating/price ratio at or above this value (undervalued) or at or below (overpriced).
-   */
+  /** @deprecated Not used by search Cypher; undervalued/overpriced use `pred_avg_quality` bounds + env thresholds. */
   proxyRatingPerDollarMin?: number | null;
+  /** @deprecated Not used by search Cypher. */
   proxyRatingPerDollarMax?: number | null;
   /** BGG username for "games I do not own" style filters */
   usernameExcludesOwns?: string | null;
@@ -158,13 +222,16 @@ export interface SearchExplain {
   wtt: number;
   owns: number;
   rankValue: number | null;
+  /** Always null — graph has no `value_score`; use `game.predAvgQuality`. */
   valueScore: number | null;
+  /** Always null — “value” flags are expressed via ridge `pred_avg_quality` filters. */
   overpriced: boolean | null;
+  /** Always null — same as `overpriced`. */
   undervalued: boolean | null;
   ratingPerDollar: number | null;
-  /** (min mean_price in window − latest) / null if unknown */
+  /** Always null — price-window drop was removed from search Cypher. */
   priceDropVsWindowMin: number | null;
-  /** Whether ORDER BY value_score was available */
+  /** Always false — no `value_score` on `:Game`. */
   hasValueScoreProp: boolean;
   sort: SearchSortField;
   preset: QueryPresetId | null;
@@ -174,6 +241,9 @@ export interface SearchHit {
   game: GameSummary;
   explain: SearchExplain;
 }
+
+/** API filter bar + `/api/recommend` body — same optional keys as QuerySpec */
+export type GameFiltersPayload = Partial<QuerySpec>;
 
 export interface SearchRequestBody {
   message?: string;
@@ -190,16 +260,8 @@ export interface SearchRequestBody {
    * @default false
    */
   includeGraph?: boolean;
-  /** @deprecated use query + /api/search; kept for /api/recommend */
-  filters?: {
-    keyword?: string;
-    players?: number | null;
-    maxTime?: number | null;
-    maxPrice?: number | null;
-    minRating?: number | null;
-    preset?: QueryPresetId | null;
-    sort?: SearchSortField;
-  };
+  /** @deprecated use query + /api/search */
+  filters?: GameFiltersPayload;
 }
 
 export interface SearchApiResponse {
@@ -221,15 +283,7 @@ export interface RecommendCriteria {
 
 export interface RecommendRequestBody {
   message?: string;
-  filters?: {
-    keyword?: string;
-    players?: number | null;
-    maxTime?: number | null;
-    maxPrice?: number | null;
-    minRating?: number | null;
-    preset?: QueryPresetId | null;
-    sort?: SearchSortField;
-  };
+  filters?: GameFiltersPayload;
 }
 
 export interface SearchMeta {

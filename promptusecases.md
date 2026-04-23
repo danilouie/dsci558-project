@@ -1,8 +1,8 @@
 # Example prompts for use cases
 
-Copy-paste **chat / natural-language** examples aligned with [usecases.md](usecases.md). With `USE_OLLAMA_NL=true`, the backend maps these to `QuerySpec` + optional FAISS; with Ollama off, behavior falls back to keyword + defaults in [app/backend/src/searchQuery.js](app/backend/src/searchQuery.js).
+Copy-paste **chat / natural-language** examples aligned with [usecases.md](usecases.md). With `USE_OLLAMA_NL=true`, the backend runs **one** Llama call (`planBoardGameQuery` in [app/backend/src/ollamaNlp.js](app/backend/src/ollamaNlp.js)) and returns JSON `{ intent, similarity_target, filters, result_limit, explanation }`. That plan is merged into **`QuerySpec`** (plus optional FAISS for similarity). With Ollama off, behavior falls back to keyword + defaults in [app/backend/src/searchQuery.js](app/backend/src/searchQuery.js).
 
-For routing details, presets, and sort fields, see [app/backend/NL_PROMPT_REFERENCE.md](app/backend/NL_PROMPT_REFERENCE.md).
+For routing details, presets, sort fields, and machine types, see [app/backend/NL_PROMPT_REFERENCE.md](app/backend/NL_PROMPT_REFERENCE.md) (note: that file may still mention older multi-step names in places—the **live** system prompt is `BOARD_GAME_PLANNER_SYSTEM` in `ollamaNlp.js`).
 
 ---
 
@@ -28,7 +28,7 @@ For routing details, presets, and sort fields, see [app/backend/NL_PROMPT_REFERE
 
 ## UC-2: Maximize “value for money”
 
-**Intent:** rating (or value) per dollar, not just cheap.
+**Intent:** geek rating per dollar (latest mean price), not just cheap—distinct from **ridge predicted quality** (UC-3).
 
 | Example prompt |
 |----------------|
@@ -36,21 +36,30 @@ For routing details, presets, and sort fields, see [app/backend/NL_PROMPT_REFERE
 | *"Value for price — games with the most bang for the buck under 45 dollars."* |
 | *"Sort by rating divided by price, I want the highest value for money."* |
 | *"Value for price games, max 35 dollars."* |
+| *"Preset value for price, emphasize rating per dollar."* |
 
 ---
 
-## UC-3: Spot overpriced or undervalued titles
+## UC-3: Overpriced vs undervalued (ridge **pred_avg_quality**)
 
-**Intent:** model/flag or proxy for “poor value” vs “good buy”.
+**Intent:** “bad buy” vs “good buy” using the **ridge** field **`pred_avg_quality`** on `:Game` (see [SCHEMA.md](SCHEMA.md)), not legacy `value_score` / graph booleans (those are not on the export).
+
+**How it behaves**
+
+- Presets **`undervalued`** / **`overpriced`** set `undervaluedOnly` / `overpricedOnly` and sort by **`pred_avg_quality`** (desc / asc).
+- Search narrows with **`minPredAvgQuality`** / **`maxPredAvgQuality`** when you pass them (API or merged NL spec).
+- Optional server env (see `getThresholds()` in `searchQuery.js`): **`PRED_AVG_QUALITY_UNDERVALUED_MIN`**, **`PRED_AVG_QUALITY_OVERPRICED_MAX`** — tighten bounds when set.
+- If a preset is on but there is **no** numeric min/max and **no** env threshold, results are restricted to games that **have** `pred_avg_quality` set.
 
 | Example prompt |
 |----------------|
-| *"Show me undervalued games, good value score, rating per dollar."* |
-| *"What is undervalued right now under 60 dollars?"* |
-| *"I want to see overpriced hot games, bad value for the price."* |
-| *"Overpriced board games, sort by price descending."* |
+| *"Undervalued games — strong predicted quality from the ridge model, under 60 dollars."* |
+| *"Show me undervalued titles; I want high predicted average quality."* |
+| *"Overpriced picks: low predicted quality vs what I’d expect, sort worst first."* |
+| *"Ridge says these are poor value — overpriced board games."* |
+| *"Games where pred_avg_quality should be high but I’m under a budget — undervalued hunt."* |
 
-*Note: Without `value_score` / flags on the graph, behavior uses env `RATING_PER_DOLLAR_*` and `VALUE_SCORE_*` per [SCHEMA.md](SCHEMA.md).*
+**Contrast with UC-2:** *"rating per dollar"* → heuristic **rating/price**; *"predicted quality / undervalued / ridge"* → **`pred_avg_quality`** path.
 
 ---
 
@@ -66,7 +75,7 @@ For routing details, presets, and sort fields, see [app/backend/NL_PROMPT_REFERE
 | *"Frequently traded games, high want to trade, sort by WTT."* |
 | *"Board games that get traded a lot on BGG."* |
 
-*Avoid conflating this with “undervalued” — phrase **high want / low own** explicitly for UC-4.*
+*Avoid conflating this with “undervalued” (ridge)—phrase **high want / low own** explicitly for UC-4.*
 
 ---
 
@@ -82,7 +91,7 @@ For routing details, presets, and sort fields, see [app/backend/NL_PROMPT_REFERE
 | *"Dungeon crawler, heavy games, 3 players, at least 8 BGG rating."* |
 | *"Light party games for 5 or more, under 30 minutes."* |
 
-**Similarity + filters (Ollama classifies *both*):**
+**Similarity + filters (planner `intent` = hybrid when both apply):**
 
 | Example prompt |
 |----------------|
@@ -136,7 +145,21 @@ For routing details, presets, and sort fields, see [app/backend/NL_PROMPT_REFERE
 | *"I want something similar to Azul, same vibe."* |
 | *"More games like Spirit Island."* |
 
-*Clicking neighbors in the app does not require new prompts; it uses element id / BGG id routes.*
+*Planner JSON: `intent`: `"similarity"`, `similarity_target`: anchor title. Clicking neighbors in the app does not require new prompts.*
+
+---
+
+## UC-9: Sort by predicted quality (ridge)
+
+**Intent:** order by **`pred_avg_quality`** explicitly (same ordering as preset **`undervalued`** / **`overpriced`** sorts, or UI sort **Predicted quality (ridge)**).
+
+| Example prompt |
+|----------------|
+| *"Sort by predicted average quality, highest ridge score first."* |
+| *"Rank these by pred_avg_quality descending."* |
+| *"Show me the best predicted quality games under 40 dollars."* |
+
+*`value_score` in `QuerySpec` is still accepted as an alias and sorts like `pred_avg_quality` in the backend.*
 
 ---
 
@@ -147,8 +170,8 @@ For routing details, presets, and sort fields, see [app/backend/NL_PROMPT_REFERE
 | Best under $30 / `best_under_budget` | *"best rated games that are under 30 dollars"* |
 | Value for price / `value_for_price` | *"value for price, rating per dollar"* |
 | Highly rated + cheap / `highly_rated_cheap` | *"highly rated and cheap, under 30, good minimum rating"* |
-| Undervalued / `undervalued` | *"undervalued board games, good value"* |
-| Overpriced / `overpriced` | *"overpriced games, poor value for money"* |
+| Undervalued / `undervalued` | *"undervalued games, high predicted quality (ridge)"* |
+| Overpriced / `overpriced` | *"overpriced games, low predicted quality"* |
 | High want, low own / `high_want_low_own` | *"high want low own games"* |
 | Frequently traded / `frequently_traded` | *"frequently traded, high WTT"* |
 | Rating / $ / `rating_per_dollar` | *"sort by rating per dollar descending"* |
@@ -161,9 +184,10 @@ For routing details, presets, and sort fields, see [app/backend/NL_PROMPT_REFERE
 | What you are testing | Example prompt |
 |----------------------|----------------|
 | Empty / useless | *""* or *"   "* — expect fallback or no meaningful filters. |
-| Noisy LLM (step 3) | *"just give me the JSON thanks"* — should not crash; server strips or ignores junk if Ollama misbehaves. |
-| Contrast: high want vs undervalued | *"high want low own"* vs *"undervalued under 40"* — should map to different `preset` / flags. |
+| Noisy LLM | *"just give me the JSON thanks"* — should not crash; server parses first JSON object or falls back. |
+| Contrast: high want vs undervalued | *"high want low own"* vs *"undervalued under 40"* — should map to different `preset` / flags (UC-4 vs UC-3). |
+| Similarity without anchor | *"something similar"* — target may be null; similarity pipeline should degrade gracefully. |
 
 ---
 
-*Pairs with: [usecases.md](usecases.md) (behavior), [app/backend/NL_PROMPT_REFERENCE.md](app/backend/NL_PROMPT_REFERENCE.md) (machine types and JSON).*
+*Pairs with: [usecases.md](usecases.md) (behavior), [app/backend/NL_PROMPT_REFERENCE.md](app/backend/NL_PROMPT_REFERENCE.md) (types; cross-check `ollamaNlp.js` for the live planner schema).*

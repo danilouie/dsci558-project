@@ -4,6 +4,8 @@
 
 The CSV pipeline ([`scripts/build_neo4j_csvs.py`](../scripts/build_neo4j_csvs.py)) accepts **`--overlap-only`**. When set, only games whose **`bgg_id`** appears in **`bgo_key_bgg_map.tsv`** (rows with both a non-empty Oracle `key` and `bgg_id`) are written to `games.csv`, `ranks.csv`, and related edges; `bgo_keys.csv` is restricted to that overlap (`export_mapping` with `price_histories/key_name.tsv` keeps only keys present in the mapping TSV and drops rows whose resolved `bgg_id` is outside the overlap). BGQ **`reviews`**, BGG **`bgg_reviews`** / edges, and user–game **`OWNS` / `WANTS*`** rows are emitted only when that **`bgg_id`** is both in the overlap set and present in **`games.jsonl`** (`valid_bgg_ids`). With **`--overlap-only`**, **`users.csv`** is limited to usernames that appear on at least one of those filtered collection or BGG-review edges (owners with no remaining rows after filtering are omitted). Full exports without the flag still list every collection-file owner, as before. Games listed in the mapping but missing from `games.jsonl` export as no `(:Game)` row until the JSONL includes them.
 
+**`--ridge-whitelist`:** Pass a path to `ridge_predictions_with_price_stats.csv` (or an equivalent file with the same `bgg_id` and `pred_avg_quality` / `mean_of_mean` / `max_of_max` / `min_of_min` columns). Only those **`bgg_id`**s define the export universe (this overrides overlap filtering from **`--overlap-only`**, since the set comes from the ridge file). The four stat columns are merged into **`games.csv`** and loaded onto **`(:Game)`** by [`neo4j/load/02_nodes_games.cypher`](../neo4j/load/02_nodes_games.cypher).
+
 ### Core identifiers
 - **Game**: `bgg_id` (string) is the stable unique ID.
 - **BGOKey**: `key` (string) is the stable unique ID.
@@ -32,25 +34,8 @@ The CSV pipeline ([`scripts/build_neo4j_csvs.py`](../scripts/build_neo4j_csvs.py
 - `complexity` (float)
 - `categories` (list<string>) (imported from pipe-delimited string)
 - `mechanisms` (list<string>) (imported from pipe-delimited string)
-- **Price** is not a first-class BGG field on `(:Game)` in this graph. For pricing, use **`(:PricePoint)`** (see below): the app’s search path typically uses the **latest** `mean_price` on `(g:Game)-[:HAS_PRICE_POINT]->(p:PricePoint)`; for other analytics you can also use the **mean of `mean_price` over all** `PricePoint` rows for a game, or a min across a time window, depending on the use case.
 - Optional rank breakdowns: `abstracts_rank`, `strategygames_rank`, etc.
-- **Model / value (optional, added when ML pipeline is wired to the graph):**
-  - `value_score` (float, optional) — model-predicted value; used by the app for sort and “undervalued” style filters when present.
-  - `overpriced` (boolean, optional) — flag for games that are overpriced for what they offer (thresholds defined in your training job / ETL).
-  - `undervalued` (boolean, optional) — flag for games that are a good buy relative to the model.
-- The API also supports **environment-based thresholds** (see below) for `value_score` and for **rating-per-dollar** proxies when booleans or scores are missing.
-
-**App environment (backend) for value thresholds**
-
-These are read at process startup (see `getThresholds()` in `app/backend/src/searchQuery.js`). They align with the training notebook’s `value_score` and rating/price heuristics:
-
-- `VALUE_SCORE_UNDERVALUED_MIN` (optional; alias accepted: `VALUE_SCORE_UNDERVAlUED_MIN` — typographical variant) — if &gt; 0, a game with `value_score` ≥ this counts as “undervalued” in the over/under filter branch.
-- `VALUE_SCORE_OVERPRICED_MAX` (optional) — if &gt; 0, a game with `value_score` ≤ this counts as “overpriced” in that branch.
-- `RATING_PER_DOLLAR_UNDERVALUED_MIN` (optional; alias: `RATING_PER_DOLLAR_UNDERVAlUED_MIN`) — default in code `0.2`; used when `undervaluedOnly` is on and the graph has no `undervalued` / `value_score` signal, as a **proxy** (rating / latest mean price).
-- `RATING_PER_DOLLAR_OVERPRICED_MAX` (optional) — default `0.08`; **proxy** for overpriced when model flags are absent.
-- `USE_SEARCH_DEFAULT` — if not `false`, `POST /api/recommend` runs the structured search first, then falls back to the legacy single-center pick.
-
-**Performance note:** Crowd filters use `count { (User)-[...]->(g) }` in Cypher. If the graph is large, consider ETL to store `wants_count`, `owns_count`, etc. on `(:Game)` and switch the app query to use those properties.
+- When using **`--ridge-whitelist`:** `pred_avg_quality`, `mean_of_mean`, `max_of_max`, `min_of_min` (float, optional; null if missing in `games.csv`)
 
 #### `(:BGOKey)`
 - `key` (string, unique)

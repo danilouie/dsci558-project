@@ -112,6 +112,10 @@ export function gameNodeToSummary(node, extras = {}) {
     bestMaxPlayers: toNum(p.best_max_players ?? p.best_maxplayers),
     isExpansion: toBool(p.is_expansion),
     rank: toNum(p.rank),
-    estimatedPrice: extras.estimatedPrice != null && Number.isFinite(Number(extras.estimatedPrice)) ? Number(extras.estimatedPrice) : null
+    estimatedPrice: extras.estimatedPrice != null && Number.isFinite(Number(extras.estimatedPrice)) ? Number(extras.estimatedPrice) : null,
+    predAvgQuality: toNum(p.pred_avg_quality),
+    meanOfMean: toNum(p.mean_of_mean),
+    maxOfMax: toNum(p.max_of_max),
+    minOfMin: toNum(p.min_of_min)
   };
 }

@@ -1,16 +1,24 @@
 /**
- * Ollama JSON extraction for NL → QuerySpec and prompt routing.
- * @typedef {import("../../shared/contracts.d.ts").PromptKind} PromptKind
+ * Ollama JSON planner: single-shot NL → PlannerResponse → QuerySpec.
  * @typedef {import("../../shared/contracts.d.ts").QuerySpec} QuerySpec
  * @typedef {import("../../shared/contracts.d.ts").QueryPresetId} QueryPresetId
  * @typedef {import("../../shared/contracts.d.ts").SearchSortField} SearchSortField
+ * @typedef {import("../../shared/contracts.d.ts").PlannerIntent} PlannerIntent
+ * @typedef {import("../../shared/contracts.d.ts").PlannerFiltersPayload} PlannerFiltersPayload
+ * @typedef {import("../../shared/contracts.d.ts").PlannerResponse} PlannerResponse
  */
 
-import { ollamaLog, isOllamaLogEnabled } from "./trace.js";
+import { ollamaLog, isOllamaLogEnabled, traceStep } from "./trace.js";
 
 const OLLAMA_HOST = (process.env.OLLAMA_HOST || "http://127.0.0.1:11434").replace(/\/$/, "");
 const OLLAMA_MODEL = process.env.OLLAMA_MODEL || "llama3";
 const OLLAMA_TIMEOUT_MS = Math.max(5000, Number(process.env.OLLAMA_TIMEOUT_MS || 60000));
+
+/**
+ * Second-pass validation: strip filter values the planner invented but the user did not say.
+ * Set `OLLAMA_PLANNER_GROUNDING=false` to disable (saves one Ollama round-trip).
+ */
+export const USE_PLANNER_GROUNDING = process.env.OLLAMA_PLANNER_GROUNDING !== "false";
 
 const VALID_PRESETS = /** @type {QueryPresetId[]} */ ([
   "best_under_budget",
@@ -35,36 +43,105 @@ const VALID_SORT = /** @type {SearchSortField[]} */ ([
   "value_score",
   "wants",
   "wtt",
-  "price_drop"
+  "price_drop",
+  "pred_avg_quality"
 ]);
 
-/** Keys Step A may emit (subset of QuerySpec). */
-export const FILTER_ACTIVE_KEYS = [
-  "keyword",
-  "preset",
-  "players",
-  "maxTime",
-  "maxPrice",
-  "minPrice",
-  "minRating",
-  "categoryContains",
-  "mechanismContains",
-  "minComplexity",
-  "maxComplexity",
-  "minWants",
-  "minOwns",
-  "undervaluedOnly",
-  "overpricedOnly",
-  "sort",
-  "sortDirection",
-  "usernameExcludesOwns",
-  "priceWindowDays",
-  "minPriceDrop"
-];
+/** Single system prompt — board-game query planner (JSON only). */
+export const BOARD_GAME_PLANNER_SYSTEM = `You are a query planner for a board game database.
+Given a user message, output ONLY valid JSON with this exact schema:
+
+{
+  "intent": "filter" | "similarity" | "hybrid",
+  "similarity_target": string | null,
+  "filters": {
+    "min_players": int | null,
+    "max_players": int | null,
+    "min_playtime": int | null,
+    "max_playtime": int | null,
+    "max_complexity": float | null,
+    "min_complexity": float | null,
+    "categories": [string] | null,
+    "mechanisms": [string] | null,
+    "min_avg_rating": float | null,
+    "max_price": float | null,
+    "year_from": int | null,
+    "year_to": int | null,
+    "max_min_age": int | null,
+    "is_expansion": bool | null
+  },
+  "preset": string | null,
+  "undervalued_only": bool | null,
+  "overpriced_only": bool | null,
+  "sort": string | null,
+  "sort_direction": "asc" | "desc" | null,
+  "result_limit": int,
+  "explanation": string
+}
+
+Rules:
+- If the user asks to find similar games: intent = "similarity"
+- If the user asks to filter/search by attributes only: intent = "filter"
+- If both are present (e.g. "games similar to Catan but for 2 players"): intent = "hybrid"
+- similarity_target: anchor game title when intent is similarity or hybrid; otherwise null
+- Only include filter fields that are explicitly or clearly implied; use null for omitted keys
+- **Ridge value (NOT BGG rating):** In this app, "undervalued" / "good predicted quality" / "ridge undervalued" means high **pred_avg_quality** on games — NOT higher BGG geek rating. Do **not** set min_avg_rating just because the user said "undervalued"; only set min_avg_rating if they ask for a **BGG/average/geek rating** number or phrase (e.g. "rating at least 8").
+- **Overpriced** means low pred_avg_quality (ridge), not low geek rating by itself — use overpriced_only or preset "overpriced", not min_avg_rating unless they asked for rating.
+- preset: use when a named bundle fits: "best_under_budget", "value_for_price", "highly_rated_cheap", "overpriced", "undervalued", "high_want_low_own", "frequently_traded", "rating_per_dollar", "composite_demo", or null.
+- undervalued_only: true when the user wants ridge-undervalued picks (high pred_avg_quality); pair with sort "pred_avg_quality" desc unless they ask to sort by something else (e.g. wants, wtt).
+- overpriced_only: true for ridge-overpriced / low pred_avg_quality emphasis.
+- "traded a lot" / "frequently traded" / high WTT on BGG → preset "frequently_traded" (sort wtt). You can combine with undervalued_only if they ask for both (e.g. undervalued games that trade often).
+- sort / sort_direction: only if the user asks for a specific ordering; otherwise null (defaults apply downstream).
+- result_limit: default 10 when unstated
+- explanation: one short sentence of reasoning for logs only`;
+
+/** Grounding agent: removes unstated numeric/topic constraints from the draft planner JSON. */
+export const PLANNER_GROUNDING_SYSTEM = `You are a strict grounding editor for board-game query plans.
+
+The user's message is the ONLY source of allowed constraints.
+
+You receive the USER_MESSAGE and a DRAFT_PLAN JSON (same schema as below). Output ONLY valid JSON with this exact schema:
+
+{
+  "intent": "filter" | "similarity" | "hybrid",
+  "similarity_target": string | null,
+  "filters": {
+    "min_players": int | null,
+    "max_players": int | null,
+    "min_playtime": int | null,
+    "max_playtime": int | null,
+    "max_complexity": float | null,
+    "min_complexity": float | null,
+    "categories": [string] | null,
+    "mechanisms": [string] | null,
+    "min_avg_rating": float | null,
+    "max_price": float | null,
+    "year_from": int | null,
+    "year_to": int | null,
+    "max_min_age": int | null,
+    "is_expansion": bool | null
+  },
+  "preset": string | null,
+  "undervalued_only": bool | null,
+  "overpriced_only": bool | null,
+  "sort": string | null,
+  "sort_direction": "asc" | "desc" | null,
+  "result_limit": int,
+  "explanation": string
+}
+
+Rules:
+- For every field inside "filters": set it to null (or empty array only if the key must be an array and nothing is grounded—use null for categories/mechanisms when nothing is grounded) if the USER_MESSAGE does not explicitly state it or clearly paraphrase it (same numbers, times, prices, player counts, category names, mechanism names, year ranges, complexity, expansion yes/no).
+- Remove "helpful" invented numbers: e.g. do NOT keep max_price, min_avg_rating, min_players, etc. unless the user actually gave that bound.
+- **Undervalued** in this product means ridge **pred_avg_quality** (high = undervalued), NOT BGG min_avg_rating. If the draft used min_avg_rating only because of the word "undervalued", remove min_avg_rating unless the user also asked for a concrete BGG/geek rating.
+- Do NOT remove undervalued_only / preset "undervalued" when the user said undervalued (ridge sense). Do NOT remove preset "frequently_traded" when they said traded a lot / WTT.
+- Phrases like "overpriced" WITHOUT numeric bounds do NOT justify max_price or min_avg_rating by themselves.
+- Keep intent and similarity_target only if justified: e.g. similarity_target must match a game title the user referenced for similarity; otherwise null for filter-only messages.
+- result_limit: keep a number only if the user asked for a count ("top 5", "10 games"); otherwise use 10.
+- explanation: one short sentence listing what was removed or "unchanged", for logs.`;
 
 /**
- * First balanced `{ ... }` in text (handles strings/escapes). Models often prepend
- * prose like "Here's the JSON:" before the object.
+ * First balanced `{ ... }` in text (handles strings/escapes).
  * @param {string} raw
  * @returns {string | null}
  */
@@ -102,7 +179,6 @@ export function extractFirstJsonObject(raw) {
 
 /**
  * Strip ```json fences and parse JSON object.
- * Falls back to extracting the first `{...}` when the model wraps output in prose.
  * @param {string} raw
  */
 export function parseJsonObject(raw) {
@@ -129,7 +205,7 @@ export function parseJsonObject(raw) {
 
 /**
  * @param {{ role: string, content: string }[]} messages
- * @param {{ temperature?: number, label?: string }} [opts] - `label` names the NL pipeline step in logs
+ * @param {{ temperature?: number, label?: string, format?: "json" }} [opts]
  */
 export async function ollamaChat(messages, opts = {}) {
   const step = opts.label || "ollamaChat";
@@ -138,24 +214,30 @@ export async function ollamaChat(messages, opts = {}) {
       model: OLLAMA_MODEL,
       host: OLLAMA_HOST,
       temperature: opts.temperature ?? 0.1,
+      format: opts.format,
       messages: messages.map((m) => ({ role: m.role, content: m.content }))
     });
   }
   const controller = new AbortController();
   const t = setTimeout(() => controller.abort(), OLLAMA_TIMEOUT_MS);
   try {
+    /** @type {Record<string, unknown>} */
+    const body = {
+      model: OLLAMA_MODEL,
+      messages,
+      stream: false,
+      options: {
+        temperature: opts.temperature ?? 0.1
+      }
+    };
+    if (opts.format === "json") {
+      body.format = "json";
+    }
     const res = await fetch(`${OLLAMA_HOST}/api/chat`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       signal: controller.signal,
-      body: JSON.stringify({
-        model: OLLAMA_MODEL,
-        messages,
-        stream: false,
-        options: {
-          temperature: opts.temperature ?? 0.1
-        }
-      })
+      body: JSON.stringify(body)
     });
     if (!res.ok) {
       const text = await res.text();
@@ -176,221 +258,245 @@ export async function ollamaChat(messages, opts = {}) {
 }
 
 /**
- * @param {string} message
- * @returns {Promise<{ promptKind: PromptKind, similarToGame: string | null }>}
+ * @param {unknown} v
  */
-export async function classifyPromptKind(message) {
-  const sys = `You route board-game discovery chat prompts.
-Return ONLY valid JSON (no markdown):
-{"promptKind":"similar_to_game"|"filtering"|"both","similarToGame":string|null}
-
-Definitions:
-- similar_to_game: user wants games LIKE / SIMILAR TO / reminiscent of a named title only (e.g. "like Catan") with no extra budget/category/mechanism constraints.
-- filtering: only constraints — budget, player count, play time, presets ("high want low own"), undervalued, categories, mechanisms, sort — no named reference game.
-- both: combines a reference game AND any other constraint — price, players, time, category/mechanism (including quoted "strategy" category), presets, sorts.
-
-similarToGame: short anchor title ONLY when promptKind is similar_to_game or both; otherwise null.
-Examples:
-- "games like Terraforming Mars" -> {"promptKind":"similar_to_game","similarToGame":"Terraforming Mars"}
-- "under $40 for 4 players" -> {"promptKind":"filtering","similarToGame":null}
-- "high want low own similar to Gloomhaven" -> {"promptKind":"both","similarToGame":"Gloomhaven"}
-- "similar to Catan in the strategy category" -> {"promptKind":"both","similarToGame":"Catan"}
-- "games like Wingspan in this \\"economic\\" category" -> {"promptKind":"both","similarToGame":"Wingspan"}
-- "similar game like Catan in \\"wargame\\" category" -> {"promptKind":"both","similarToGame":"Catan"}`;
-
-  const raw = await ollamaChat(
-    [
-      { role: "system", content: sys },
-      { role: "user", content: String(message).trim() }
-    ],
-    { temperature: 0, label: "1.classifyPromptKind" }
-  );
-  const o = parseJsonObject(raw);
-  const pk = o.promptKind;
-  if (pk !== "similar_to_game" && pk !== "filtering" && pk !== "both") {
-    throw new Error(`Invalid promptKind: ${pk}`);
-  }
-  const st = o.similarToGame;
-  const similarToGame =
-    st != null && String(st).trim() !== "" ? String(st).trim().slice(0, 120) : null;
-  const out = { promptKind: /** @type {PromptKind} */ (pk), similarToGame };
-  ollamaLog("1.classifyPromptKind", "parsed", out);
-  return out;
+function numOrNull(v) {
+  if (v == null) return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
 }
 
 /**
- * Pick at most one category shard slug for description FAISS, or null for all_games.
- * @param {string} message
- * @param {string[]} allowedSlugs - from GET /v1/category-slugs (exact folder names)
- * @returns {Promise<string | null>}
+ * @param {unknown} raw
+ * @returns {PlannerIntent}
  */
-export async function selectFaissCategorySlug(message, allowedSlugs) {
-  const list = (allowedSlugs || []).filter(Boolean);
-  if (!list.length) return null;
-
-  const slugList = list.slice().sort().join(", ");
-  const sys = `You route board-game similarity search to ONE optional per-category embedding index (shard), or none.
-
-Return ONLY valid JSON (no markdown):
-{"faissCategorySlug": string | null}
-
-Allowed values for faissCategorySlug — EXACT strings (pick one verbatim or null):
-${slugList}
-
-Rules:
-- Use null when the user wants generally similar games across the whole catalog with no category-scoped vector index.
-  - Set faissCategorySlug ONLY when they clearly tie similarity to a category family that matches one slug.
-  - If unsure or no slug fits, null.
-- Don't include category slug if the user is not explicitly asking for a category-scoped similarity search.
-
-Examples:
-- "games similar to Everdell in fantasy" -> {"faissCategorySlug":"fantasy"}
-- "cheap games like Azul" -> {"faissCategorySlug":null}`;
-
-  const raw = await ollamaChat(
-    [{ role: "system", content: sys }, { role: "user", content: String(message).trim() }],
-    { temperature: 0, label: "5.selectFaissCategorySlug" }
-  );
-  const o = parseJsonObject(raw);
-  const slug = o.faissCategorySlug;
-  if (slug == null || String(slug).trim() === "") {
-    ollamaLog("5.selectFaissCategorySlug", "parsed", { faissCategorySlug: null, allowedMatch: true });
-    return null;
-  }
-  const s = String(slug).trim();
-  const set = new Set(list);
-  const out = set.has(s) ? s : null;
-  ollamaLog("5.selectFaissCategorySlug", "parsed", { modelSlug: s, allowlistHit: out !== null, faissCategorySlug: out });
-  return out;
+function coerceIntent(raw) {
+  const s = String(raw || "").trim().toLowerCase();
+  if (s === "filter" || s === "similarity" || s === "hybrid") return /** @type {PlannerIntent} */ (s);
+  return "filter";
 }
 
 /**
- * Step A — which filter dimensions apply.
- * @param {string} message
+ * Map planner nested filters → QuerySpec fragment (before sanitize).
+ * @param {unknown} filtersRaw
+ * @returns {Partial<QuerySpec>}
  */
-export async function filterStepActiveKinds(message) {
-  const keys = FILTER_ACTIVE_KEYS.join(", ");
-  const sys = `You list which board-game search filters the user intends. Return ONLY valid JSON:
-{"active": string[]}
+export function plannerFiltersToQuerySpec(filtersRaw) {
+  const f =
+    filtersRaw && typeof filtersRaw === "object" && !Array.isArray(filtersRaw)
+      ? /** @type {PlannerFiltersPayload} */ (filtersRaw)
+      : /** @type {PlannerFiltersPayload} */ ({});
 
-Allowed filter keys (use exact strings): ${keys}
-
-Include a key only if the user clearly implies it. Use "preset" when they match a preset-style intent (budget shoppers, undervalued, high want low own, trades, etc.).
-ALWAYS include "maxPrice" when they cap budget: under/below/less than $X or X dollars.
-ALWAYS include "minRating" when they require a rating floor.
-IMPORTANT: If the user restricts by **board-game category** (e.g. "in the strategy category", "in this \\"economic\\" category", "category \\"fantasy\\""), you MUST include "categoryContains".
-If they restrict by **mechanism** (e.g. "worker placement"), include "mechanismContains".
-If the message ONLY says they want games **similar/like** a **named title** and states NO budget, players, time, category, mechanism, preset, sort, or rating, return **{"active":[]}"** (do not use "keyword" for the title — the similarity anchor is not a name search).
-Empty array if nothing filter-specific.`;
-
-  const raw = await ollamaChat(
-    [
-      { role: "system", content: sys },
-      { role: "user", content: String(message).trim() }
-    ],
-    { temperature: 0, label: "2.filterStepActiveKinds" }
-  );
-  const o = parseJsonObject(raw);
-  const active = o.active;
-  if (!Array.isArray(active)) {
-    throw new Error("filterStepActiveKinds: missing active array");
-  }
-  const set = new Set(FILTER_ACTIVE_KEYS);
-  const out = active.map((x) => String(x)).filter((k) => set.has(k));
-  ollamaLog("2.filterStepActiveKinds", "parsed", { active: out });
-  return out;
-}
-
-/**
- * Step B — extract values for selected keys only.
- * @param {string} message
- * @param {string[]} active
- */
-export async function filterStepExtractValues(message, active) {
-  if (!active.length) {
-    ollamaLog("3.filterStepExtractValues", "skip (no active keys from step 2)", {});
-    return {};
-  }
-
-  const presetList = VALID_PRESETS.join(", ");
-  const sortList = VALID_SORT.join(", ");
-
-  const sys = `You extract structured filter values for a board-game database QuerySpec.
-Return ONLY valid JSON with keys that appear in THIS list (omit keys with no value):
-ACTIVE_KEYS: ${JSON.stringify(active)}
-
-Rules:
-- preset must be one of: ${presetList} or null
-- sort must be one of: ${sortList} or null
-- sortDirection: "asc" or "desc" when sort is set
-- categoryContains / mechanismContains: arrays of short lowercase substrings that match BGG-style category/mechanism names (e.g. user says in \\"strategy\\" category -> ["strategy"]; "economic category" -> ["economic"])
-- players, maxTime, maxPrice, minPrice, minRating, minWants, minOwns, minComplexity, maxComplexity: numbers only when stated
-- undervaluedOnly, overpricedOnly: booleans
-- keyword: short search substring for game name ONLY when user gives a direct title search (not the "similar to X" anchor — that is handled elsewhere)
-- Use null or omit fields you cannot infer`;
-
-  const raw = await ollamaChat(
-    [
-      { role: "system", content: sys },
-      { role: "user", content: String(message).trim() }
-    ],
-    { temperature: 0, label: "3.filterStepExtractValues" }
-  );
-  const o = parseJsonObject(raw);
   /** @type {Partial<QuerySpec>} */
-  const out = {};
-  for (const k of active) {
-    if (Object.prototype.hasOwnProperty.call(o, k)) {
-      out[/** @type {keyof QuerySpec} */ (k)] = /** @type {any} */ (o[k]);
+  const q = {};
+
+  const mp = numOrNull(f.min_players);
+  const xp = numOrNull(f.max_players);
+  if (mp != null) q.filterMinPlayers = mp;
+  if (xp != null) q.filterMaxPlayers = xp;
+
+  const mi = numOrNull(f.min_playtime);
+  const xa = numOrNull(f.max_playtime);
+  if (mi != null) q.minPlaytime = mi;
+  if (xa != null) q.maxTime = xa;
+
+  const mic = numOrNull(f.min_complexity);
+  const mac = numOrNull(f.max_complexity);
+  if (mic != null) q.minComplexity = mic;
+  if (mac != null) q.maxComplexity = mac;
+
+  if (Array.isArray(f.categories) && f.categories.length) {
+    q.categoryContains = f.categories.map((s) => String(s).toLowerCase().trim()).filter(Boolean);
+  }
+  if (Array.isArray(f.mechanisms) && f.mechanisms.length) {
+    q.mechanismContains = f.mechanisms.map((s) => String(s).toLowerCase().trim()).filter(Boolean);
+  }
+
+  const mr = numOrNull(f.min_avg_rating);
+  if (mr != null) q.minRating = mr;
+
+  const mpz = numOrNull(f.max_price);
+  if (mpz != null) q.maxPrice = mpz;
+
+  const y0 = numOrNull(f.year_from);
+  const y1 = numOrNull(f.year_to);
+  if (y0 != null) q.minYear = Math.round(y0);
+  if (y1 != null) q.maxYear = Math.round(y1);
+
+  const age = numOrNull(f.max_min_age);
+  if (age != null) q.maxMinAge = Math.round(age);
+
+  if (f.is_expansion === true || f.is_expansion === false) {
+    q.isExpansion = f.is_expansion;
+  }
+
+  return q;
+}
+
+/**
+ * Parse and validate planner JSON from Ollama.
+ * @param {Record<string, unknown>} o
+ * @returns {PlannerResponse}
+ */
+export function parsePlannerResponse(o) {
+  const intent = coerceIntent(o.intent);
+  const st = o.similarity_target;
+  const similarity_target =
+    st != null && String(st).trim() !== "" ? String(st).trim().slice(0, 160) : null;
+
+  const filters =
+    o.filters && typeof o.filters === "object" && !Array.isArray(o.filters)
+      ? /** @type {PlannerFiltersPayload} */ (o.filters)
+      : {};
+
+  let result_limit = numOrNull(o.result_limit);
+  if (result_limit == null || result_limit < 1) result_limit = 10;
+  result_limit = Math.min(200, Math.max(1, Math.round(result_limit)));
+
+  const explanation =
+    typeof o.explanation === "string" ? o.explanation.slice(0, 500) : "";
+
+  /** @type {import("../../shared/contracts.d.ts").QueryPresetId | null} */
+  let preset = null;
+  const presetRaw = o.preset;
+  if (typeof presetRaw === "string" && VALID_PRESETS.includes(/** @type {QueryPresetId} */ (presetRaw))) {
+    preset = /** @type {import("../../shared/contracts.d.ts").QueryPresetId} */ (presetRaw);
+  }
+
+  const undervalued_only = o.undervalued_only === true;
+  const overpriced_only = o.overpriced_only === true;
+
+  /** @type {import("../../shared/contracts.d.ts").SearchSortField | null} */
+  let sort = null;
+  const sortRaw = o.sort;
+  if (typeof sortRaw === "string" && VALID_SORT.includes(/** @type {SearchSortField} */ (sortRaw))) {
+    sort = /** @type {import("../../shared/contracts.d.ts").SearchSortField} */ (sortRaw);
+  }
+
+  /** @type {"asc" | "desc" | null} */
+  let sort_direction = null;
+  const sd = o.sort_direction;
+  if (sd === "asc" || sd === "desc") sort_direction = sd;
+
+  return {
+    intent,
+    similarity_target,
+    filters,
+    result_limit,
+    explanation,
+    preset,
+    undervalued_only,
+    overpriced_only,
+    sort,
+    sort_direction
+  };
+}
+
+/**
+ * Map planner top-level fields (preset, ridge flags, sort) → QuerySpec fragment.
+ * @param {import("../../shared/contracts.d.ts").PlannerResponse} plan
+ * @returns {Partial<QuerySpec>}
+ */
+export function plannerResponseToQuerySpec(plan) {
+  /** @type {Partial<QuerySpec>} */
+  const q = {};
+
+  if (plan.preset != null && VALID_PRESETS.includes(plan.preset)) {
+    q.preset = plan.preset;
+  }
+  if (plan.undervalued_only === true) q.undervaluedOnly = true;
+  if (plan.overpriced_only === true) q.overpricedOnly = true;
+  if (plan.sort != null && VALID_SORT.includes(plan.sort)) {
+    q.sort = plan.sort;
+  }
+  if (plan.sort_direction === "asc" || plan.sort_direction === "desc") {
+    q.sortDirection = plan.sort_direction;
+  }
+
+  return q;
+}
+
+/**
+ * @param {PlannerResponse} plan
+ */
+function summarizePlanForTrace(plan) {
+  return {
+    intent: plan.intent,
+    hasTarget: Boolean(plan.similarity_target),
+    filters: plan.filters,
+    preset: plan.preset ?? null,
+    undervalued_only: plan.undervalued_only === true,
+    overpriced_only: plan.overpriced_only === true,
+    sort: plan.sort ?? null,
+    sort_direction: plan.sort_direction ?? null,
+    result_limit: plan.result_limit
+  };
+}
+
+/**
+ * Second agent: strip hallucinated filters; on failure returns the draft unchanged.
+ * @param {string} userMessage
+ * @param {PlannerResponse} draft
+ * @returns {Promise<PlannerResponse>}
+ */
+export async function groundPlannerAgainstUserMessage(userMessage, draft) {
+  const msg = String(userMessage || "").trim();
+  if (!msg) return draft;
+
+  const payload = JSON.stringify({ user_message: msg, draft_plan: draft }, null, 2);
+  const raw = await ollamaChat(
+    [
+      { role: "system", content: PLANNER_GROUNDING_SYSTEM },
+      { role: "user", content: payload }
+    ],
+    { temperature: 0, format: "json", label: "planGroundingValidate" }
+  );
+  const o = parseJsonObject(raw);
+  return parsePlannerResponse(o);
+}
+
+/**
+ * Single Ollama round-trip → structured plan.
+ * Optional second pass (default on) removes unstated filter fields.
+ * @param {string} userMessage
+ * @returns {Promise<PlannerResponse>}
+ */
+export async function planBoardGameQuery(userMessage) {
+  const msg = String(userMessage || "").trim();
+  const raw = await ollamaChat(
+    [
+      { role: "system", content: BOARD_GAME_PLANNER_SYSTEM },
+      { role: "user", content: msg }
+    ],
+    { temperature: 0, format: "json", label: "planBoardGameQuery" }
+  );
+  const o = parseJsonObject(raw);
+  /** @type {PlannerResponse} */
+  let plan = parsePlannerResponse(o);
+  ollamaLog("planBoardGameQuery", "parsed", { intent: plan.intent, hasTarget: Boolean(plan.similarity_target) });
+
+  if (USE_PLANNER_GROUNDING && msg) {
+    const before = summarizePlanForTrace(plan);
+    try {
+      plan = await groundPlannerAgainstUserMessage(msg, plan);
+      traceStep("ollama", "planGroundingValidate merged", {
+        before,
+        after: summarizePlanForTrace(plan),
+        groundingOn: true
+      });
+      ollamaLog("planGroundingValidate", "parsed", summarizePlanForTrace(plan));
+    } catch (err) {
+      traceStep("ollama", "planGroundingValidate failed; using draft plan", {
+        message: /** @type {Error} */ (err).message
+      });
     }
   }
-  ollamaLog("3.filterStepExtractValues", "parsed (subset by active keys)", out);
-  return out;
+
+  return plan;
 }
 
 /**
- * Step C — re-read the user message and output corrected filter fields (no regex; pure LLM).
- * Merged over the A+B result so missed keys are filled.
- * @param {string} message
- * @param {Partial<import("../../shared/contracts.d.ts").QuerySpec>} currentPartial
- * @returns {Promise<Partial<import("../../shared/contracts.d.ts").QuerySpec>>}
- */
-export async function reconcileQuerySpecFromMessage(message, currentPartial) {
-  const currentJson = JSON.stringify(currentPartial || {});
-  const keys = FILTER_ACTIVE_KEYS.join(", ");
-  const sys = `You complete a board-game search QuerySpec from the user's words only.
-
-Return ONLY a JSON object (no markdown, no text before or after) whose keys are a **subset of**: ${keys}
-
-The earlier extraction pass produced (may be incomplete or wrong; fix it if needed):
-${currentJson}
-
-Rules:
-- Only include a key if the user clearly asked for that filter.
-- maxPrice: dollars (e.g. "under 35" / "under $35" -> 35, "less than 50 dollars" -> 50).
-- minPrice: if they say "over $X" for price floor.
-- minRating: 1-10. "Geek rating", "BGG rating", "at least 7" -> set minRating.
-- categoryContains / mechanismContains: lowercase substrings, arrays.
-- players, maxTime, minComplexity, maxComplexity, preset, sort, undervaluedOnly, overpricedOnly: as usual.
-- If the message has no structural filters, return exactly: {}.
-- Do not invent constraints the user did not state.
-- The earlier pass may have wrongly set "keyword" to a "similar to X" title, or a "preset" the user never asked for — return only what the user actually said, and use \`"preset": null\` in JSON to drop a spurious earlier preset when the user did not request that preset.`;
-
-  const raw = await ollamaChat(
-    [
-      { role: "system", content: sys },
-      { role: "user", content: String(message).trim() }
-    ],
-    { temperature: 0, label: "4.reconcileQuerySpec" }
-  );
-  const o = parseJsonObject(raw);
-  const sanitized = sanitizeQuerySpec(/** @type {Partial<import("../../shared/contracts.d.ts").QuerySpec>} */ (o));
-  ollamaLog("4.reconcileQuerySpec", "parsed (after sanitizeQuerySpec)", sanitized);
-  return sanitized;
-}
-
-/**
- * Coerce LLM partial spec into safe QuerySpec fields.
+ * Coerce LLM / API partial spec into safe QuerySpec fields.
  * @param {Partial<QuerySpec>} raw
  */
 export function sanitizeQuerySpec(raw) {
@@ -429,16 +535,29 @@ export function sanitizeQuerySpec(raw) {
   };
 
   if (raw.players != null) q.players = optNum(raw.players);
+  if (raw.supportsPlayerCount != null) q.supportsPlayerCount = optNum(raw.supportsPlayerCount);
+  if (raw.filterMinPlayers != null) q.filterMinPlayers = optNum(raw.filterMinPlayers);
+  if (raw.filterMaxPlayers != null) q.filterMaxPlayers = optNum(raw.filterMaxPlayers);
   if (raw.maxTime != null) q.maxTime = optNum(raw.maxTime);
+  if (raw.minPlaytime != null) q.minPlaytime = optNum(raw.minPlaytime);
   if (raw.maxPrice != null) q.maxPrice = optNum(raw.maxPrice);
   if (raw.minPrice != null) q.minPrice = optNum(raw.minPrice);
   if (raw.minRating != null) q.minRating = optNum(raw.minRating);
   if (raw.minComplexity != null) q.minComplexity = optNum(raw.minComplexity);
   if (raw.maxComplexity != null) q.maxComplexity = optNum(raw.maxComplexity);
+  if (raw.minYear != null) q.minYear = optNum(raw.minYear);
+  if (raw.maxYear != null) q.maxYear = optNum(raw.maxYear);
+  if (raw.maxMinAge != null) q.maxMinAge = optNum(raw.maxMinAge);
+  if (raw.minPredAvgQuality != null) q.minPredAvgQuality = optNum(raw.minPredAvgQuality);
+  if (raw.maxPredAvgQuality != null) q.maxPredAvgQuality = optNum(raw.maxPredAvgQuality);
   if (raw.minWants != null) q.minWants = optNum(raw.minWants);
   if (raw.minOwns != null) q.minOwns = optNum(raw.minOwns);
   if (raw.priceWindowDays != null) q.priceWindowDays = optNum(raw.priceWindowDays);
   if (raw.minPriceDrop != null) q.minPriceDrop = optNum(raw.minPriceDrop);
+  if (raw.limit != null) {
+    const L = optNum(raw.limit);
+    if (L != null) q.limit = Math.min(200, Math.max(1, Math.round(L)));
+  }
 
   if (raw.undervaluedOnly === true) q.undervaluedOnly = true;
   if (raw.overpricedOnly === true) q.overpricedOnly = true;
@@ -447,11 +566,19 @@ export function sanitizeQuerySpec(raw) {
     q.usernameExcludesOwns = String(raw.usernameExcludesOwns).trim();
   }
 
+  if (raw.isExpansion === true || raw.isExpansion === false) {
+    q.isExpansion = raw.isExpansion;
+  }
+
   if (Array.isArray(raw.categoryContains) && raw.categoryContains.length) {
-    q.categoryContains = raw.categoryContains.map((s) => String(s).toLowerCase()).slice(0, 20);
+    q.categoryContains = raw.categoryContains.map((s) => String(s).toLowerCase().trim()).slice(0, 40);
   }
   if (Array.isArray(raw.mechanismContains) && raw.mechanismContains.length) {
-    q.mechanismContains = raw.mechanismContains.map((s) => String(s).toLowerCase()).slice(0, 20);
+    q.mechanismContains = raw.mechanismContains.map((s) => String(s).toLowerCase().trim()).slice(0, 40);
+  }
+
+  if (Array.isArray(raw.bggIdAllowList) && raw.bggIdAllowList.length) {
+    q.bggIdAllowList = raw.bggIdAllowList.map((x) => String(x)).slice(0, 500);
   }
 
   return q;
