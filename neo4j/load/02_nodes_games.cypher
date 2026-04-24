@@ -28,5 +28,9 @@ CALL {
     g.partygames_rank = CASE WHEN row.partygames_rank = '' THEN null ELSE toInteger(row.partygames_rank) END,
     g.strategygames_rank = CASE WHEN row.strategygames_rank = '' THEN null ELSE toInteger(row.strategygames_rank) END,
     g.thematic_rank = CASE WHEN row.thematic_rank = '' THEN null ELSE toInteger(row.thematic_rank) END,
-    g.wargames_rank = CASE WHEN row.wargames_rank = '' THEN null ELSE toInteger(row.wargames_rank) END
+    g.wargames_rank = CASE WHEN row.wargames_rank = '' THEN null ELSE toInteger(row.wargames_rank) END,
+    g.pred_avg_quality = CASE WHEN coalesce(row.pred_avg_quality, '') = '' THEN null ELSE toFloat(row.pred_avg_quality) END,
+    g.mean_of_mean = CASE WHEN coalesce(row.mean_of_mean, '') = '' THEN null ELSE toFloat(row.mean_of_mean) END,
+    g.max_of_max = CASE WHEN coalesce(row.max_of_max, '') = '' THEN null ELSE toFloat(row.max_of_max) END,
+    g.min_of_min = CASE WHEN coalesce(row.min_of_min, '') = '' THEN null ELSE toFloat(row.min_of_min) END
 } IN TRANSACTIONS OF 200 ROWS;

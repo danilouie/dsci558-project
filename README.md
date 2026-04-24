@@ -18,9 +18,27 @@ Creates CSVs under `neo4j/import/`:
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+```
 
+**Full export** (every game in `games.jsonl` and related sources, subject to normal ETL rules):
+
+```bash
 python3 scripts/build_neo4j_csvs.py
 ```
+
+**BGO–BGG overlap only** (games whose `bgg_id` appears in `bgo_key_bgg_map.tsv`):
+
+```bash
+python3 scripts/build_neo4j_csvs.py --overlap-only
+```
+
+**Ridge / price-stats universe** (only `bgg_id`s in `ridge_predictions_with_price_stats.csv`; merges `pred_avg_quality`, `mean_of_mean`, `max_of_max`, `min_of_min` into `games.csv`). Use this when rebuilding the KG to match that file; then clear Neo4j and run [`neo4j/load/run_all.sh`](neo4j/load/run_all.sh) (see step 4–5).
+
+```bash
+python3 scripts/build_neo4j_csvs.py --ridge-whitelist ridge_predictions_with_price_stats.csv
+```
+
+Paths for `--ridge-whitelist` are resolved from the project root if not absolute. See also [`neo4j/SCHEMA.md`](neo4j/SCHEMA.md).
 
 The ETL includes these rules:
 - skips `PricePoint` rows where all price fields are null (`min`, `mean`, `max`)
@@ -59,6 +77,15 @@ Use the loader runner (includes chunked pricepoint import):
 ```bash
 ./neo4j/load/run_all.sh
 ```
+
+**Reload after a filtered export** (e.g. `--ridge-whitelist`): if the graph already contains nodes from a previous import, **empty the graph** before loading so the KG matches the new CSVs only:
+
+```bash
+echo 'MATCH (n) DETACH DELETE n;' | docker exec -i dsci558-neo4j cypher-shell -u neo4j -p password
+./neo4j/load/run_all.sh
+```
+
+Alternatively, a **full data reset** (new empty store) is step 4) followed by `run_all.sh` as above.
 
 If load fails mid-way, restart and resume from a step:
 

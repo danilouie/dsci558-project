@@ -47,6 +47,18 @@ def main() -> None:
         default=False,
         help="Only export games whose bgg_id appears in bgo_key_bgg_map.tsv (BGO↔BGG overlap).",
     )
+    parser.add_argument(
+        "--ridge-whitelist",
+        type=Path,
+        default=None,
+        help=(
+            "Path to ridge_predictions_with_price_stats.csv (or equivalent). "
+            "Only games whose bgg_id appears in this file are exported; pred_avg_quality, "
+            "mean_of_mean, max_of_max, min_of_min are merged into games.csv. "
+            "Implies a ridge-defined game universe (overrides --overlap-only for filtering). "
+            "Relative paths are resolved from the project root."
+        ),
+    )
     args = parser.parse_args()
 
     cfg = ExportConfig(
@@ -59,6 +71,7 @@ def main() -> None:
         limit_user_collection_files=args.limit_user_collection_files,
         only_collection_username=args.only_collection_user,
         overlap_only=args.overlap_only,
+        ridge_whitelist_csv=args.ridge_whitelist,
     )
 
     counts = export_all(paths, cfg)

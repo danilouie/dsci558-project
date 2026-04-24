@@ -39,6 +39,11 @@ class ExportConfig:
     # If True, only games in bgo_key_bgg_map.tsv (non-empty key + bgg_id) are exported.
     overlap_only: bool = False
 
+    # If set, only games whose bgg_id appears in this CSV are exported; the four stat columns
+    # (pred_avg_quality, mean_of_mean, max_of_max, min_of_min) are merged into games.csv.
+    # When set, this defines the game universe (overrides overlap_only for the filter set).
+    ridge_whitelist_csv: Optional[Path] = None
+
 
 def load_overlap_bgg_ids(paths: ProjectPaths) -> set[str]:
     """Overlap bgg_ids: mapping TSV rows with non-empty Oracle key and bgg_id."""
@@ -49,6 +54,32 @@ def load_overlap_bgg_ids(paths: ProjectPaths) -> set[str]:
         if key and bgg_id:
             out.add(bgg_id)
     return out
+
+
+RIDGE_STAT_KEYS = (
+    "pred_avg_quality",
+    "mean_of_mean",
+    "max_of_max",
+    "min_of_min",
+)
+
+
+def load_ridge_predictions_csv(
+    path: Path,
+) -> tuple[set[str], dict[str, dict[str, str]]]:
+    """
+    Read `ridge_predictions_with_price_stats.csv`-style file.
+    Returns (bgg_id set, bgg_id -> {stat column -> string value for CSV}).
+    """
+    ids: set[str] = set()
+    by_bgg: dict[str, dict[str, str]] = {}
+    for row in csv_iter(path):
+        bgg_id = str(row.get("bgg_id", "")).strip()
+        if not bgg_id:
+            continue
+        ids.add(bgg_id)
+        by_bgg[bgg_id] = {k: str(row.get(k, "") or "") for k in RIDGE_STAT_KEYS}
+    return ids, by_bgg
 
 
 def _pipe_list(v: Any) -> str:
@@ -70,6 +101,7 @@ def export_games(
     paths: ProjectPaths,
     cfg: ExportConfig,
     overlap_bgg_ids: Optional[set[str]] = None,
+    ridge_stats_by_bgg_id: Optional[dict[str, dict[str, str]]] = None,
 ) -> tuple[int, dict[str, str]]:
     """
     Returns (count, bgg_id->name) for later matching.
@@ -104,6 +136,8 @@ def export_games(
         "thematic_rank",
         "wargames_rank",
     ]
+    # Ridge model / price stats (empty unless ridge whitelist is used)
+    fieldnames = list(fieldnames) + list(RIDGE_STAT_KEYS)
 
     name_by_bgg_id: dict[str, str] = {}
 
@@ -123,7 +157,7 @@ def export_games(
             if name:
                 name_by_bgg_id[bgg_id] = name
 
-            yield {
+            out_row: dict[str, Any] = {
                 "bgg_id": bgg_id,
                 "name": name,
                 "year": parse_int(obj.get("year")),
@@ -152,6 +186,14 @@ def export_games(
                 "thematic_rank": parse_int(obj.get("thematic_rank")),
                 "wargames_rank": parse_int(obj.get("wargames_rank")),
             }
+            st = (
+                ridge_stats_by_bgg_id.get(bgg_id)
+                if ridge_stats_by_bgg_id is not None
+                else None
+            ) or {k: "" for k in RIDGE_STAT_KEYS}
+            for k in RIDGE_STAT_KEYS:
+                out_row[k] = st.get(k, "")
+            yield out_row
 
     count = write_csv(out_path, fieldnames, rows())
     return count, name_by_bgg_id
@@ -851,9 +893,23 @@ def export_bgg_reviews_and_collection(
 def export_all(paths: ProjectPaths, cfg: ExportConfig) -> dict[str, int]:
     ensure_dir(cfg.out_dir)
 
-    overlap_bgg_ids: Optional[set[str]] = load_overlap_bgg_ids(paths) if cfg.overlap_only else None
+    ridge_stats_by_bgg_id: Optional[dict[str, dict[str, str]]] = None
+    if cfg.ridge_whitelist_csv is not None:
+        rw = cfg.ridge_whitelist_csv
+        if not rw.is_absolute():
+            rw = paths.root / rw
+        overlap_bgg_ids, ridge_stats_by_bgg_id = load_ridge_predictions_csv(rw)
+    elif cfg.overlap_only:
+        overlap_bgg_ids = load_overlap_bgg_ids(paths)
+    else:
+        overlap_bgg_ids = None
 
-    games_count, name_by_bgg_id = export_games(paths, cfg, overlap_bgg_ids=overlap_bgg_ids)
+    games_count, name_by_bgg_id = export_games(
+        paths,
+        cfg,
+        overlap_bgg_ids=overlap_bgg_ids,
+        ridge_stats_by_bgg_id=ridge_stats_by_bgg_id,
+    )
     mapping_count = export_mapping(paths, cfg, overlap_bgg_ids=overlap_bgg_ids)
 
     # Build bgo_key -> bgg_id map for price history linking from the exported CSV

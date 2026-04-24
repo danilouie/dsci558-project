@@ -15,11 +15,13 @@ from kg_etl.util import tsv_iter
 DOC_BGQ_REVIEW = "bgq_review"
 DOC_BGG_REVIEW = "bgg_review"
 DOC_GAME_DESCRIPTION = "game_description"
+DOC_GAME_ID_NAME = "game_id_name"
 
 _DOC_KIND_ORDER = {
     DOC_GAME_DESCRIPTION: 0,
     DOC_BGQ_REVIEW: 1,
     DOC_BGG_REVIEW: 2,
+    DOC_GAME_ID_NAME: 3,
 }
 
 
@@ -97,6 +99,40 @@ def iter_games_descriptions(games_csv: Path) -> Iterator[EmbeddingDocument]:
                 bgg_review_id=None,
                 bgg_id=bgg_id,
                 text=desc,
+            )
+
+
+def game_id_name_embed_text(name: str, bgg_id: str) -> str:
+    """Concatenate ``Game.name`` and ``Game.bgg_id`` for semantic embedding."""
+    n = (name or "").strip()
+    bid = (bgg_id or "").strip()
+    if not bid or not n:
+        return ""
+    return f"{n}\n[bgg_id: {bid}]"
+
+
+def iter_games_id_name(games_csv: Path) -> Iterator[EmbeddingDocument]:
+    """One row per game: embed ``name`` + ``bgg_id`` string; ``id_map`` still keys ``bgg_id``."""
+    if not games_csv.is_file():
+        yield from ()
+        return
+    with games_csv.open("r", encoding="utf-8", newline="") as f:
+        r = csv.DictReader(f)
+        for row in r:
+            bgg_id = (row.get("bgg_id") or "").strip()
+            name = (row.get("name") or "").strip()
+            if not bgg_id or not name:
+                continue
+            text = game_id_name_embed_text(name, bgg_id)
+            if not text:
+                continue
+            yield EmbeddingDocument(
+                doc_kind=DOC_GAME_ID_NAME,
+                sort_key=bgg_id,
+                review_id=None,
+                bgg_review_id=None,
+                bgg_id=bgg_id,
+                text=text,
             )
 
 

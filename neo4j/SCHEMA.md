@@ -4,6 +4,8 @@
 
 The CSV pipeline ([`scripts/build_neo4j_csvs.py`](../scripts/build_neo4j_csvs.py)) accepts **`--overlap-only`**. When set, only games whose **`bgg_id`** appears in **`bgo_key_bgg_map.tsv`** (rows with both a non-empty Oracle `key` and `bgg_id`) are written to `games.csv`, `ranks.csv`, and related edges; `bgo_keys.csv` is restricted to that overlap (`export_mapping` with `price_histories/key_name.tsv` keeps only keys present in the mapping TSV and drops rows whose resolved `bgg_id` is outside the overlap). BGQ **`reviews`**, BGG **`bgg_reviews`** / edges, and user–game **`OWNS` / `WANTS*`** rows are emitted only when that **`bgg_id`** is both in the overlap set and present in **`games.jsonl`** (`valid_bgg_ids`). With **`--overlap-only`**, **`users.csv`** is limited to usernames that appear on at least one of those filtered collection or BGG-review edges (owners with no remaining rows after filtering are omitted). Full exports without the flag still list every collection-file owner, as before. Games listed in the mapping but missing from `games.jsonl` export as no `(:Game)` row until the JSONL includes them.
 
+**`--ridge-whitelist`:** Pass a path to `ridge_predictions_with_price_stats.csv` (or an equivalent file with the same `bgg_id` and `pred_avg_quality` / `mean_of_mean` / `max_of_max` / `min_of_min` columns). Only those **`bgg_id`**s define the export universe (this overrides overlap filtering from **`--overlap-only`**, since the set comes from the ridge file). The four stat columns are merged into **`games.csv`** and loaded onto **`(:Game)`** by [`neo4j/load/02_nodes_games.cypher`](../neo4j/load/02_nodes_games.cypher).
+
 ### Core identifiers
 - **Game**: `bgg_id` (string) is the stable unique ID.
 - **BGOKey**: `key` (string) is the stable unique ID.
@@ -33,6 +35,7 @@ The CSV pipeline ([`scripts/build_neo4j_csvs.py`](../scripts/build_neo4j_csvs.py
 - `categories` (list<string>) (imported from pipe-delimited string)
 - `mechanisms` (list<string>) (imported from pipe-delimited string)
 - Optional rank breakdowns: `abstracts_rank`, `strategygames_rank`, etc.
+- When using **`--ridge-whitelist`:** `pred_avg_quality`, `mean_of_mean`, `max_of_max`, `min_of_min` (float, optional; null if missing in `games.csv`)
 
 #### `(:BGOKey)`
 - `key` (string, unique)
