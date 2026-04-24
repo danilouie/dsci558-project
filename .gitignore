@@ -6,7 +6,10 @@ neo4j/logs/
 neo4j/import/
 embeddings/all-MiniLM-L6-v2-full/
 embeddings/smoke-5games-MiniLM/
+embeddings/__pycache__/
 extracting_forum_data/*.zip
 extracting_forum_data/*.jsonl
 game_feature_export/artifacts/
 game_feature_export/*/artifacts/
+models/
+value_models/
