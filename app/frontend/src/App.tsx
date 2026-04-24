@@ -1,12 +1,16 @@
 import { CSSProperties, FormEvent, PointerEvent as ReactPointerEvent, useEffect, useMemo, useRef, useState } from "react";
 import type {
   ApiErrorResponse,
+  BggReviewSummaryResponse,
+  BggReviewContext,
+  BgqReviewContext,
   GameFiltersPayload,
   GameSummary,
   GraphApiResponse,
   GraphNode,
   GraphPayload,
   NlParseMeta,
+  PricePointContext,
   QueryPresetId,
   RecommendRequestBody,
   SearchMeta,
@@ -52,7 +56,7 @@ interface Position {
   opacity: number;
 }
 
-type NodeShape = "center" | "primary" | "secondary";
+type NodeShape = "center" | "primary" | "secondary" | "context";
 
 interface LayoutNode extends Position {
   shape: NodeShape;
@@ -112,16 +116,53 @@ function buildDemoGraph(centerId = demoCatalog[0].id): GraphPayload {
     similarity: 0.95 - index * 0.05
   }));
 
+  const demoPrice: PricePointContext = {
+    pricePointId: "demo-pp",
+    date: "2024-01-15",
+    minPrice: 25,
+    meanPrice: 32.5,
+    maxPrice: 40,
+    source: "BGO"
+  };
+  const demoBgg: BggReviewContext = {
+    bggReviewId: "demo-bgg",
+    username: "DemoUser",
+    rating: 8.5,
+    commentText: "Great game for the table. Would play again.",
+    sources: "collection",
+    page: 1
+  };
+  const priceNode: GraphNode = {
+    id: "demo-ctx-price",
+    bggId: null,
+    name: "$32.50 · 2024-01-15",
+    kind: "context",
+    graphEntityType: "pricePoint",
+    context: demoPrice
+  };
+  const bggNode: GraphNode = {
+    id: "demo-ctx-bgg",
+    bggId: null,
+    name: "@DemoUser",
+    kind: "context",
+    graphEntityType: "bggReview",
+    context: demoBgg
+  };
+
   return {
     centerId: center.id,
     neighborMode: "similarity",
-    nodes: [center, ...neighbors],
-    edges: neighbors.map((neighbor) => ({
-      id: `${center.id}->${neighbor.id}`,
-      source: center.id,
-      target: neighbor.id,
-      weight: neighbor.similarity ?? 0
-    }))
+    nodes: [center, ...neighbors, priceNode, bggNode],
+    edges: [
+      ...neighbors.map((neighbor) => ({
+        id: `${center.id}->${neighbor.id}`,
+        source: center.id,
+        target: neighbor.id,
+        weight: neighbor.similarity ?? 0
+      })),
+      { id: `${center.id}->${priceNode.id}`, source: center.id, target: priceNode.id, weight: 0.05 },
+      { id: `${center.id}->${bggNode.id}`, source: center.id, target: bggNode.id, weight: 0.05 }
+    ]
   };
 }
 
@@ -269,6 +310,11 @@ function formatEstPrice(g: GameSummary): string {
   return `$${p.toFixed(2)}`;
 }
 
+function formatContextMoney(value: number | null | undefined): string {
+  if (value == null || !Number.isFinite(value)) return "—";
+  return `$${value.toFixed(2)}`;
+}
+
 function formatRidgeMetric(value: number | null | undefined, decimals = 4): string {
   if (value == null || !Number.isFinite(value)) return "—";
   return value.toFixed(decimals);
@@ -304,6 +350,41 @@ function stableUnit(id: string, salt = 0): number {
   }
 
   return (hash >>> 0) / 4294967295;
+}
+
+/** 0–4 slot for per-node color within the price point ring. */
+function contextColorSlot(id: string, entitySalt: number): number {
+  return Math.floor(stableUnit(id, entitySalt) * 5) % 5;
+}
+
+const PRICE_LINE_STROKES = [
+  "rgba(234, 179, 8, 0.42)", // amber
+  "rgba(245, 158, 11, 0.45)", // orange
+  "rgba(20, 184, 166, 0.42)", // teal
+  "rgba(16, 185, 129, 0.42)", // emerald
+  "rgba(6, 182, 212, 0.42)" // sky
+] as const;
+
+const BGQ_LINE_STROKE = "rgba(168, 85, 247, 0.4)";
+
+const BGG_LINE_STROKE = "rgba(45, 212, 191, 0.42)";
+
+function contextLineStroke(node: GraphNode): string {
+  if (node.kind !== "context" || !node.graphEntityType) return "rgba(140, 180, 255, 0.3)";
+  const t = node.graphEntityType;
+  if (t === "bgqReview") return BGQ_LINE_STROKE;
+  if (t === "pricePoint") return PRICE_LINE_STROKES[contextColorSlot(node.id, 3)];
+  if (t === "bggReview") return BGG_LINE_STROKE;
+  return "rgba(140, 180, 255, 0.3)";
+}
+
+function contextNodeKindClass(node: GraphNode): string {
+  if (node.kind !== "context" || !node.graphEntityType) return "";
+  const t = node.graphEntityType;
+  if (t === "bgqReview") return "context-kind-bgq";
+  if (t === "pricePoint") return `context-kind-price context-kind-price-${contextColorSlot(node.id, 3)}`;
+  if (t === "bggReview") return "context-kind-bgg";
+  return "";
 }
 
 function asApiError(payload: unknown): ApiErrorResponse {
@@ -350,8 +431,10 @@ function GraphCanvas({ graph, activeNodeId, onNodeClick, promptAnchorBggId = nul
     return <div className="graph-shell" />;
   }
 
-  const neighbors = graph.nodes
-    .filter((node) => node.id !== center.id)
+  const allNonCenter = graph.nodes.filter((node) => node.id !== center.id);
+  const contextOrbit = allNonCenter.filter((node) => node.kind === "context");
+  const gameNeighbors = allNonCenter
+    .filter((node) => node.kind !== "context")
     .sort((left, right) => {
       if (graph.neighborMode === "search_hits") {
         return (left.queryResultRank ?? 0) - (right.queryResultRank ?? 0);
@@ -371,9 +454,9 @@ function GraphCanvas({ graph, activeNodeId, onNodeClick, promptAnchorBggId = nul
     }
 
     const positions = new Map<string, LayoutNode>();
-    const primaryCount = Math.min(6, neighbors.length);
-    const primaryNodes = neighbors.slice(0, primaryCount);
-    const secondaryGroups = neighbors.slice(primaryCount);
+    const primaryCount = Math.min(6, gameNeighbors.length);
+    const primaryNodes = gameNeighbors.slice(0, primaryCount);
+    const secondaryGroups = gameNeighbors.slice(primaryCount);
     const primaryAngles = new Map<string, number>();
     const secondaryCounts = new Map<string, number>();
     const orbitNodes: MutableOrbitNode[] = [];
@@ -503,8 +586,22 @@ function GraphCanvas({ graph, activeNodeId, onNodeClick, promptAnchorBggId = nul
       });
     });
 
+    const innerR = 172;
+    contextOrbit.forEach((node, index) => {
+      const n = contextOrbit.length;
+      const angle = baseRotation * 0.35 + (Math.PI * 2 * index) / Math.max(n, 1) + stableUnit(node.id, 19) * 0.14;
+      const r = innerR + stableUnit(node.id, 7) * 10;
+      positions.set(node.id, {
+        x: Math.cos(angle) * r,
+        y: Math.sin(angle) * r * 0.97,
+        scale: activeNodeId === node.id ? 0.92 : 0.78,
+        opacity: 0.96,
+        shape: "context"
+      });
+    });
+
     return positions;
-  }, [activeNodeId, center.id, graph.neighborMode, neighbors]);
+  }, [activeNodeId, center.id, graph.neighborMode, gameNeighbors, contextOrbit]);
 
   function rotateAndSelectNode(node: GraphNode): void {
     if (Date.now() < suppressClickUntilRef.current) return;
@@ -536,6 +633,7 @@ function GraphCanvas({ graph, activeNodeId, onNodeClick, promptAnchorBggId = nul
   function nodeRadius(shape: NodeShape): number {
     if (shape === "center") return 102;
     if (shape === "primary") return 72;
+    if (shape === "context") return 20;
     return 10;
   }
 
@@ -563,6 +661,14 @@ function GraphCanvas({ graph, activeNodeId, onNodeClick, promptAnchorBggId = nul
   }
 
   function nodeTooltip(node: GraphNode, position: LayoutNode): string {
+    if (position.shape === "context") {
+      const t = node.graphEntityType;
+      if (t === "pricePoint") return `${node.name} | market price point`;
+      if (t === "bgqReview") return `${node.name} | BoardGameGeek (BGQ) review`;
+      if (t === "bggReview") return `${node.name} | BGG user review`;
+      return `${node.name} | context node`;
+    }
+
     if (position.shape === "secondary") {
       const sub =
         graph.neighborMode === "search_hits" && node.queryResultRank != null
@@ -632,7 +738,27 @@ function GraphCanvas({ graph, activeNodeId, onNodeClick, promptAnchorBggId = nul
         <div className="graph-stage" style={{ transform: `translate3d(${dragOffset.x + focusOffset.x}px, ${dragOffset.y + focusOffset.y}px, 0)` }}>
           <svg className="graph-lines" viewBox="0 0 1200 900" aria-hidden="true">
             {graph.nodes
-              .filter((node) => node.kind !== "center")
+              .filter((node) => node.kind === "context")
+              .map((node) => {
+                const target = layout.get(node.id);
+                const source = layout.get(center.id);
+                if (!target || !source) return null;
+                const endpoints = lineEndpoints(source, target);
+                return (
+                  <line
+                    key={`ctx-line-${node.id}`}
+                    x1={endpoints.x1}
+                    y1={endpoints.y1}
+                    x2={endpoints.x2}
+                    y2={endpoints.y2}
+                    stroke={contextLineStroke(node)}
+                    strokeWidth={1.5}
+                    strokeLinecap="round"
+                  />
+                );
+              })}
+            {graph.nodes
+              .filter((node) => node.kind === "neighbor")
               .map((node) => {
                 const target = layout.get(node.id);
                 if (!target) return null;
@@ -671,13 +797,15 @@ function GraphCanvas({ graph, activeNodeId, onNodeClick, promptAnchorBggId = nul
               zIndex: Math.round(500 - Math.abs(position.y)),
               ["--bob-duration" as string]: `${Math.round(3600 + motionSeed * 2200)}ms`,
               ["--bob-delay" as string]: `-${Math.round(motionSeed * 1800)}ms`,
-              ["--bob-range" as string]: `${position.shape === "secondary" ? 6 : position.shape === "primary" ? 4 : 2}px`
+              ["--bob-range" as string]: `${position.shape === "secondary" ? 6 : position.shape === "primary" ? 4 : position.shape === "context" ? 3 : 2}px`
             };
 
             return (
               <button
                 key={node.id}
-                className={`graph-node ${position.shape} ${isActive ? "active" : ""}`}
+                className={`graph-node ${position.shape} ${
+                  position.shape === "context" ? contextNodeKindClass(node) : ""
+                } ${isActive ? "active" : ""}`}
                 title={nodeTooltip(node, position)}
                 aria-label={nodeTooltip(node, position)}
                 style={motionStyle}
@@ -686,7 +814,13 @@ function GraphCanvas({ graph, activeNodeId, onNodeClick, promptAnchorBggId = nul
               >
                 <span className="node-inner">
                   <span className="node-glow" />
-                  {isCenter || position.shape === "primary" ? <span className="node-name">{node.name}</span> : <span className="node-dot" aria-hidden="true" />}
+                  {position.shape === "context" ? (
+                    <span className="node-name node-name--context">{node.name}</span>
+                  ) : isCenter || position.shape === "primary" ? (
+                    <span className="node-name">{node.name}</span>
+                  ) : (
+                    <span className="node-dot" aria-hidden="true" />
+                  )}
                   {isCenter || position.shape === "primary" ? (
                     <span className="node-meta">
                       {isCenter
@@ -723,6 +857,17 @@ function App() {
   const [chatOpen, setChatOpen] = useState<boolean>(false);
   /** Set when /api/recommend returns nlParse (prompt anchor BGG id for similarity queries). */
   const [promptNlParse, setPromptNlParse] = useState<NlParseMeta | null>(null);
+  const [bggOllamaSummary, setBggOllamaSummary] = useState<string>("");
+  const [bggOllamaReviewCount, setBggOllamaReviewCount] = useState<number | null>(null);
+  const [bggOllamaLoading, setBggOllamaLoading] = useState(false);
+  const [bggOllamaError, setBggOllamaError] = useState<string>("");
+
+  useEffect(() => {
+    setBggOllamaSummary("");
+    setBggOllamaReviewCount(null);
+    setBggOllamaError("");
+    setBggOllamaLoading(false);
+  }, [graph.centerId]);
 
   useEffect(() => {
     let ignore = false;
@@ -841,12 +986,19 @@ function App() {
   async function handleNodeClick(node: GraphNode): Promise<void> {
     if (!node.id || node.id === activeNodeId) return;
 
+    if (node.kind === "context" && node.graphEntityType) {
+      setSelectedGame(node);
+      setActiveNodeId(node.id);
+      setError("");
+      return;
+    }
+
     setSelectedGame(node);
     setLoading(true);
     setError("");
 
     try {
-      if (node.id.startsWith("demo-")) {
+      if (node.id.startsWith("demo-") && !node.id.startsWith("demo-ctx-")) {
         const nextGraph = buildDemoGraph(node.id);
         setGraph(nextGraph);
         setActiveNodeId(nextGraph.centerId);
@@ -875,7 +1027,39 @@ function App() {
     }
   }
 
+  async function requestBggOllamaSummary(): Promise<void> {
+    const c = getCenterNode(graph);
+    if (!c?.id || c.id.startsWith("demo-")) {
+      return;
+    }
+    setBggOllamaLoading(true);
+    setBggOllamaError("");
+    setBggOllamaSummary("");
+    setBggOllamaReviewCount(null);
+    try {
+      const response = await fetch(`${API_URL}/api/graph/summarize-bgg-reviews`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ gameElementId: c.id })
+      });
+      const data = (await response.json().catch(() => ({}))) as BggReviewSummaryResponse | ApiErrorResponse;
+      if (!response.ok) {
+        setBggOllamaError(asApiError(data).error || `Request failed (${response.status})`);
+        return;
+      }
+      const ok = data as BggReviewSummaryResponse;
+      setBggOllamaSummary(typeof ok.summary === "string" ? ok.summary : "");
+      setBggOllamaReviewCount(typeof ok.reviewCount === "number" ? ok.reviewCount : null);
+    } catch (e) {
+      setBggOllamaError(e instanceof Error ? e.message : "Request failed.");
+    } finally {
+      setBggOllamaLoading(false);
+    }
+  }
+
   const centerNode = graph.nodes.find((node) => node.kind === "center") || graph.nodes[0];
+  const centerGameElementId = centerNode?.id;
+  const bggOllamaDisabled = !centerGameElementId || String(centerGameElementId).startsWith("demo-");
   const neighborCount = graph.nodes.length - 1;
 
   return (
@@ -928,7 +1112,17 @@ function App() {
         <aside className={`game-info-panel ${selectedGame ? "open" : ""}`}>
           <div className="drawer-top">
             <div>
-              <p className="drawer-kicker">Game info</p>
+              <p className="drawer-kicker">
+                {selectedGame?.kind === "context" && selectedGame.graphEntityType
+                  ? selectedGame.graphEntityType === "pricePoint"
+                    ? "Price point"
+                    : selectedGame.graphEntityType === "bgqReview"
+                      ? "BGQ review"
+                      : selectedGame.graphEntityType === "bggReview"
+                        ? "BGG user review"
+                        : "Context"
+                  : "Game info"}
+              </p>
               {promptNlParse?.anchorBggId &&
               selectedGame?.bggId &&
               String(selectedGame.bggId) === String(promptNlParse.anchorBggId) ? (
@@ -942,6 +1136,153 @@ function App() {
 
           <div className="game-info-scroll">
             {selectedGame ? (
+              selectedGame.kind === "context" && selectedGame.context && selectedGame.graphEntityType ? (
+                <>
+                  {selectedGame.graphEntityType === "pricePoint" && "pricePointId" in selectedGame.context ? (
+                    <div className="info-section">
+                      <p className="panel-context-line">Data point linked from the center game in the knowledge graph.</p>
+                      <dl className="detail-dl-rich">
+                        <div>
+                          <dt>Date</dt>
+                          <dd>{selectedGame.context.date || "—"}</dd>
+                        </div>
+                        <div>
+                          <dt>Min / mean / max</dt>
+                          <dd>
+                            {formatContextMoney((selectedGame.context as PricePointContext).minPrice)} /{" "}
+                            {formatContextMoney((selectedGame.context as PricePointContext).meanPrice)} /{" "}
+                            {formatContextMoney((selectedGame.context as PricePointContext).maxPrice)}
+                          </dd>
+                        </div>
+                        <div>
+                          <dt>Source</dt>
+                          <dd>{(selectedGame.context as PricePointContext).source || "—"}</dd>
+                        </div>
+                      </dl>
+                    </div>
+                  ) : null}
+
+                  {selectedGame.graphEntityType === "bgqReview" && "reviewId" in selectedGame.context ? (
+                    <div className="info-section">
+                      <p className="panel-context-line">BGQ (BoardGameGeek) article from the review channel.</p>
+                      <dl className="detail-dl-rich">
+                        <div>
+                          <dt>Title</dt>
+                          <dd>{(selectedGame.context as BgqReviewContext).title || "—"}</dd>
+                        </div>
+                        <div>
+                          <dt>Author</dt>
+                          <dd>{(selectedGame.context as BgqReviewContext).author || "—"}</dd>
+                        </div>
+                        <div>
+                          <dt>Score</dt>
+                          <dd>
+                            {(selectedGame.context as BgqReviewContext).score == null
+                              ? "—"
+                              : (selectedGame.context as BgqReviewContext).score!.toFixed(1)}
+                          </dd>
+                        </div>
+                        <div>
+                          <dt>Published</dt>
+                          <dd>{(selectedGame.context as BgqReviewContext).publishedAt || "—"}</dd>
+                        </div>
+                        <div>
+                          <dt>Category</dt>
+                          <dd>{(selectedGame.context as BgqReviewContext).category || "—"}</dd>
+                        </div>
+                        <div>
+                          <dt>Link</dt>
+                          <dd>
+                            {(selectedGame.context as BgqReviewContext).url ? (
+                              <a
+                                className="bgg-external"
+                                href={(selectedGame.context as BgqReviewContext).url!}
+                                target="_blank"
+                                rel="noreferrer"
+                              >
+                                Open article
+                              </a>
+                            ) : (
+                              "—"
+                            )}
+                          </dd>
+                        </div>
+                      </dl>
+                      {(selectedGame.context as BgqReviewContext).body ? (
+                        <div className="info-section info-section-tall">
+                          <h3>Excerpt</h3>
+                          <div className="context-scroll-text game-description">
+                            {(selectedGame.context as BgqReviewContext).body}
+                          </div>
+                        </div>
+                      ) : null}
+                    </div>
+                  ) : null}
+
+                  {selectedGame.graphEntityType === "bggReview" && "bggReviewId" in selectedGame.context ? (
+                    <div className="info-section">
+                      <p className="panel-context-line">User review text from the BGG graph.</p>
+                      <dl className="detail-dl-rich">
+                        <div>
+                          <dt>Username</dt>
+                          <dd>{(selectedGame.context as BggReviewContext).username || "—"}</dd>
+                        </div>
+                        <div>
+                          <dt>Rating</dt>
+                          <dd>
+                            {(selectedGame.context as BggReviewContext).rating == null
+                              ? "—"
+                              : (selectedGame.context as BggReviewContext).rating!.toFixed(1)}
+                          </dd>
+                        </div>
+                        <div>
+                          <dt>Source / page</dt>
+                          <dd>
+                            {[(selectedGame.context as BggReviewContext).sources, (selectedGame.context as BggReviewContext).page]
+                              .filter((s) => s != null && String(s) !== "")
+                              .join(" · ") || "—"}
+                          </dd>
+                        </div>
+                      </dl>
+                      <div className="info-section info-section-tall">
+                        <h3>Comment</h3>
+                        <div className="context-scroll-text game-description">
+                          {(selectedGame.context as BggReviewContext).commentText || "—"}
+                        </div>
+                      </div>
+
+                      <div className="info-section bgg-ollama-section">
+                        <h3>All BGG reviews (Ollama)</h3>
+                        <p className="panel-context-line">
+                          Summarize every BGG user review stored for the center game (up to 100 in the graph), not only
+                          the sample on the graph.
+                        </p>
+                        {bggOllamaDisabled ? (
+                          <p className="bgg-ollama-demo-note">Connect to the backend with a real Neo4j graph to use this.</p>
+                        ) : (
+                          <button
+                            className="bgg-ollama-button"
+                            type="button"
+                            disabled={bggOllamaLoading}
+                            onClick={() => void requestBggOllamaSummary()}
+                          >
+                            {bggOllamaLoading ? "Summarizing…" : "Summarize all BGG reviews"}
+                          </button>
+                        )}
+                        {bggOllamaError ? <p className="bgg-ollama-err">{bggOllamaError}</p> : null}
+                        {bggOllamaSummary ? (
+                          <>
+                            {bggOllamaReviewCount != null && bggOllamaReviewCount > 0 ? (
+                              <p className="bgg-ollama-count">From {bggOllamaReviewCount} review(s) in the graph</p>
+                            ) : null}
+                            <div className="bgg-ollama-summary">{bggOllamaSummary}</div>
+                          </>
+                        ) : null}
+                      </div>
+                    </div>
+                  ) : null}
+                </>
+              ) : (
               <>
                 <div className="info-stat-grid">
                   <article>
@@ -1142,6 +1483,7 @@ function App() {
                   </div>
                 ) : null}
               </>
+            )
             ) : (
               <p className="panel-note">Click a node to open game details here.</p>
             )}
@@ -1152,7 +1494,10 @@ function App() {
           <div className="panel-head graph-head">
             <div>
               <h2>Knowledge graph</h2>
-              <p>Click the main node or any neighbor to recenter the graph.</p>
+              <p>
+                Click the main node or any game in the ring to recenter. Inner ring: price, BGQ, and BGG data from the
+                center game.
+              </p>
             </div>
           </div>
 
@@ -1165,7 +1510,7 @@ function App() {
 
           <div className="neighbor-strip">
             {graph.nodes
-              .filter((node) => node.kind !== "center")
+              .filter((node) => node.kind === "neighbor")
               .map((node) => (
                 <button key={node.id} className="neighbor-pill" onClick={() => handleNodeClick(node)} type="button">
                   <span>{node.name}</span>

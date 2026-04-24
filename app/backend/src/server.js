@@ -14,6 +14,8 @@ import {
   USE_OLLAMA_NL
 } from "./nlQuery.js";
 import { gameNodeToSummary } from "./gameMapper.js";
+import { appendContextToGraphPayload } from "./graphContext.js";
+import { summarizeBggReviewsForGame } from "./bggReviewSummary.js";
 
 /** @typedef {import("../../shared/contracts.d.ts").ApiErrorResponse} ApiErrorResponse */
 /** @typedef {import("../../shared/contracts.d.ts").GameSummary} GameSummary */
@@ -391,7 +393,7 @@ async function graphFromCenter(centerNode) {
     };
   });
 
-  const payload = {
+  const base = {
     centerId: center.id,
     neighborMode: "similarity",
     nodes: [
@@ -405,6 +407,7 @@ async function graphFromCenter(centerNode) {
       weight: neighbor.similarity
     }))
   };
+  const payload = await appendContextToGraphPayload(runQuery, base);
   traceStep("graph", "3. graphFromCenter: done", { nodeCount: payload.nodes.length, edgeCount: payload.edges.length });
   return payload;
 }
@@ -501,6 +504,29 @@ app.get("/api/graph/bgg/:bggId", async (req, res) => {
   }
 });
 
+app.post("/api/graph/summarize-bgg-reviews", async (req, res) => {
+  const raw = req.body && typeof req.body === "object" ? req.body.gameElementId : null;
+  const gameElementId = raw != null ? String(raw).trim() : "";
+  if (!gameElementId) {
+    return res.status(400).json({ error: "Missing or invalid gameElementId." });
+  }
+  traceStep("route", "POST /api/graph/summarize-bgg-reviews", { gameElementId });
+  try {
+    const result = await summarizeBggReviewsForGame(runQuery, gameElementId);
+    if (result && "error" in result && result.error === "not_found") {
+      return res.status(404).json({ error: "Game not found." });
+    }
+    if (result && "error" in result && result.error === "ollama") {
+      return res.status(502).json({ error: result.message || "Ollama request failed." });
+    }
+    return res.json(/** @type {import("../../shared/contracts.d.ts").BggReviewSummaryResponse} */ (result));
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Unknown error";
+    traceStep("route", "POST /api/graph/summarize-bgg-reviews: error", { message });
+    return res.status(500).json({ error: message });
+  }
+});
+
 app.post("/api/search", async (req, res) => {
   traceStep("route", "POST /api/search: start");
   try {
@@ -513,7 +539,7 @@ app.post("/api/search", async (req, res) => {
         name: hits[0].game.name,
         hitCount: hits.length
       });
-      payload.graph = graphFromSearchHits(hits);
+      payload.graph = await appendContextToGraphPayload(runQuery, graphFromSearchHits(hits));
     }
     traceStep("route", "POST /api/search: 200", { hitCount: hits.length, includeGraph: Boolean(payload.graph) });
     return res.json(payload);
@@ -554,7 +580,7 @@ app.post("/api/recommend", async (req, res) => {
             preset: querySpec.preset ?? null,
             sort: querySpec.sort
           },
-          graph: graphFromSearchHits(hits)
+          graph: await appendContextToGraphPayload(runQuery, graphFromSearchHits(hits))
         });
       } else {
         traceStep("route", "POST /api/recommend: search returned 0 hits, fallback to pickCenter", {});

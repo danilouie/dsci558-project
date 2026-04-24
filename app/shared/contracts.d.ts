@@ -1,4 +1,45 @@
-export type NodeKind = "center" | "neighbor";
+export type NodeKind = "center" | "neighbor" | "context";
+
+/** Subgraph nodes attached to the center game: price history, BGQ article, BGG comments. Omitted = game node. */
+export type GraphEntityType = "game" | "pricePoint" | "bgqReview" | "bggReview";
+
+export interface PricePointContext {
+  pricePointId: string;
+  /** ISO date string when available */
+  date: string | null;
+  minPrice: number | null;
+  meanPrice: number | null;
+  maxPrice: number | null;
+  source: string | null;
+}
+
+export interface BgqReviewContext {
+  reviewId: string;
+  title: string | null;
+  author: string | null;
+  url: string | null;
+  score: number | null;
+  category: string | null;
+  publishedAt: string | null;
+  body: string | null;
+}
+
+export interface BggReviewContext {
+  bggReviewId: string;
+  username: string | null;
+  rating: number | null;
+  commentText: string | null;
+  sources: string | null;
+  page: number | null;
+}
+
+export type GraphContextPayload = PricePointContext | BgqReviewContext | BggReviewContext;
+
+/** Response from POST /api/graph/summarize-bgg-reviews (success). */
+export interface BggReviewSummaryResponse {
+  summary: string;
+  reviewCount: number;
+}
 
 export interface GameSummary {
   id: string;
@@ -48,6 +89,10 @@ export interface GameSummary {
 
 export interface GraphNode extends GameSummary {
   kind: NodeKind;
+  /** When not `game`, this node is not a BGG game row — see `context`. */
+  graphEntityType?: GraphEntityType;
+  /** Type-specific fields for context nodes (price, BGQ, BGG). */
+  context?: GraphContextPayload;
 }
 
 export interface GraphEdge {
