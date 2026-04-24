@@ -1,6 +1,7 @@
 .venv/
 .claude/
 kg_etl/__pycache__/
+neo4j/backups/
 neo4j/data/
 neo4j/logs/
 neo4j/import/
