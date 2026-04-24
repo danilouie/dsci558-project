@@ -13,3 +13,6 @@ game_feature_export/artifacts/
 game_feature_export/*/artifacts/
 models/
 value_models/
+neo4j/backups/
+artifacts/
+*.joblib
