@@ -49,6 +49,7 @@ function htmlDescriptionToPlain(html) {
     .replace(/&gt;/g, ">")
     .replace(/&quot;/g, '"')
     .replace(/\n{3,}/g, "\n\n")
+    .replace(/(?:\s*[—&ndash;\-]\s*description from the publisher\s*)$/i, "")
     .trim();
   return t.length ? t : null;
 }

@@ -268,6 +268,25 @@ button {
   box-shadow: 0 12px 24px rgba(0, 0, 0, 0.24);
 }
 
+.filter-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: center;
+}
+
+.filter-actions .secondary-button {
+  background: transparent;
+  color: var(--text);
+  border: 1px solid rgba(148, 163, 255, 0.22);
+  box-shadow: none;
+}
+
+.filter-actions .secondary-button:hover {
+  border-color: rgba(142, 167, 255, 0.5);
+  background: rgba(255, 255, 255, 0.05);
+}
+
 .panel-note {
   padding: 14px 16px;
   border-radius: 16px;

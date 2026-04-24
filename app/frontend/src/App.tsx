@@ -149,6 +149,14 @@ const defaultFilters: RecommendFilters = {
   sort: ""
 };
 
+function createDefaultFilters(): RecommendFilters {
+  return {
+    ...defaultFilters,
+    selectedCategories: [],
+    selectedMechanisms: []
+  };
+}
+
 const PRESET_CHIPS: { id: QueryPresetId; label: string }[] = [
   { id: "best_under_budget", label: "Best under $30" },
   { id: "value_for_price", label: "Value for price" },
@@ -826,6 +834,10 @@ function App() {
     setFiltersOpen(false);
   }
 
+  function handleClearFilters(): void {
+    setFilters(createDefaultFilters());
+  }
+
   async function handleNodeClick(node: GraphNode): Promise<void> {
     if (!node.id || node.id === activeNodeId) return;
 
@@ -1185,7 +1197,7 @@ function App() {
           </div>
 
           <div className="drawer-scroll">
-          <form className="filter-grid" onSubmit={handleFilterSubmit}>
+            <form className="filter-grid" onSubmit={handleFilterSubmit}>
             <label>
               Keyword (name contains)
               <input
@@ -1416,8 +1428,13 @@ function App() {
                 ))}
               </div>
             </div>
-            <button type="submit">Recommend from filters</button>
-          </form>
+              <div className="filter-actions">
+                <button type="submit">Recommend from filters</button>
+                <button type="button" className="secondary-button" onClick={handleClearFilters}>
+                  Clear all filters
+                </button>
+              </div>
+            </form>
 
           <div className="panel-note">
             <p>{status}</p>
