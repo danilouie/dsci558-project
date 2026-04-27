@@ -16,6 +16,8 @@ Creating a KG for board games
 - `bgo_download.py`: scrapes price history from BoardGameOracle $\rightarrow$ outputs in `bgo.zip`
 
 - `bgq_scrapper.py`: scrapes reviews from BoardGameQuest $\rightarrow$ outputs in `reviews.jsonl`
+
+View our video demo [here](https://www.youtube.com/watch?v=Su9MrQVmewo):
     
 
 
