@@ -1,23 +1,70 @@
-# dsci558-project
+# Board Game Knowledge Graph
+Created by: Danielle Louie, Vishal Sankar Ram
+<br></br>
+View our video demo [here](https://www.youtube.com/watch?v=Su9MrQVmewo).
 
-Creating a KG for board games
+*Please note that this github repository is still being edited and restructured.*
 
-## Files
-*Each webscraping component is currently in their own branch.*
-- `bgg_game_scraper.py`: scrapes game info from BoardGameGeek using XML and API token $\rightarrow$ outputs in `games.jsonl`
+## Code Structure
+- `filtered_kg`: contains backend code for building out the Neo4j knowledge graph.
+- `front-end`: builds out the ui component using Node.js, Vite, and React.
+- `main`: code for extracting data from sources.
 
-- `bgg_forums_scraper.py`: scrapes forum threads and articles from BoardGameGeek using XML and API $\rightarrow$ outputs in 5 files separated by forum category
-  - `recommendations.jsonl`
-  - `gaming-with-kids.jsonl`
-  - `games-in-the-classroom.jsonl`
-  - `hot-deals.jsonl`
-  - `trades.jsonl`
+## Research Questions and Project Goals
+Purchasing a board game can be a surprisingly time-consuming process. It often involves comparing reviews, browsing forums, tracking sales before deciding whether a game is worth buying. Our project aims to simplify that process by building a Board Game Knowledge Graph, aggregating information from multiple sources and supporting value-driven recommendations. 
+Our project consisted of three main research questions:
 
-- `bgo_download.py`: scrapes price history from BoardGameOracle $\rightarrow$ outputs in `bgo.zip`
+- Can we define a meaningful "value" metric that captures whether a board game is worth its price, going beyond simple user ratings?
+- Can a knowledge graph structure effectively connect heterogeneous board game data (prices, reviews, community signals) to enable rich, efficient querying?
+- Can machine learning models trained on graph-derived features accurately predict board game value and engagement?
 
-- `bgq_scrapper.py`: scrapes reviews from BoardGameQuest $\rightarrow$ outputs in `reviews.jsonl`
+The goal of this project was to create an interactive web application where users can explore game recommendations, inspect price histories, and read summarized reviews in a single platform.
 
-View our video demo [here](https://www.youtube.com/watch?v=Su9MrQVmewo):
+## Construction
+
+### Data Sources
+We built our project using three primary resources:
+
+- BoardGameGeek (BGG): The main community hub for board games. We collected structured game metadata (players, playtime, complexity, categories, mechanisms, BGG ratings, Bayes averages) via the BGG API, along with user ratings, forum threads, and comments via Scrapy and HTTP requests.
+- Board Game Oracle (BGO): A price-tracking site that aggregates retailer offers. We scraped historical price points, including daily minimum, mean, and maximum prices, to model market value over time.
+- Board Game Quest (BGQ): A publication that provides long-form, firsthand reviews with structured breakdowns: hits, misses, and a final score. We scraped these reviews and used them as ground-truth labels for the value model.
+
+### Ontology
+We then built the knowledge graph in Neo4j with five node types: Game, BggReview (user comment/rating), PricePoint (historical price observation), Review (BGQ editorial review), and User (reviewer identity). We were able to link the nodes together using the BGG IDs assigned during entity resolution.
+
+### Extraction and Entity Resolution
+We used a combination of the BGG XML API, Scrapy spiders, and direct HTTP requests for data extraction. For unstructured text, including reviews and forum threads, we applied two open-source LLMs, Llama3 and CardiffNLP, for sentiment analysis and quality scoring. We used fuzzy string matching from RapidFuzz with an 85-point confidence threshold to map game titles from the reviews and forum posts & BGQ to BGG IDs.
+
+## Value Prediction Models
+We designed a two-stage machine learning pipeline to predict a game's value score, which is a normalized measure of market worth relative to price.
+
+Model 1 (Content & Engagement Model) captures what a game is and how the community perceives it. Features include text embeddings from game descriptions and reviews, rating statistics (BGG rating, Bayes average), review dynamics (number of reviews, dispersion, reviewer diversity), and game metadata (year, complexity, player counts, playtime). The model outputs four engagement probability scores for the percentage of users who Owns, Wants, Want To Buy, and Want To Trade a particular game. LightGBM was the best-performing ML algorithm, achieving MAE of 0.021 and RMSE of 0.032.
+
+Model 2 (Price & Market Behavior Model) takes Model 1's engagement predictions as inputs and combines them with price history features (log-price statistics, volatility, coverage, slope, 4-week and 12-week trends) to predict the final value score. RandomForest performed best here, achieving MAE of 0.123 and RMSE of 0.155. On a held-out set of BGQ-reviewed games, the end-to-end pipeline achieved MAE of 0.065 and RMSE of 0.083. During training, we used weak labels for Owns, Wants, Want To Buy, and Want To Trade instead of using values generated by Model 1.
+
+Three key findings emerged during model development: (1) higher game complexity reduces audience size and lowers demand signals (2) once ownership saturation is high, more people have the game hence reduces the need of the game and (3) People hesitate to give lower ratings, hence BGG reviews are systematically inflated and skewed right, meaning raw ratings alone are poor predictors of true value.
+
+
+## Technical Challenges
+The most difficult challenge was creating a “value” metric. Value is inherently subjective: a hardcore hobbyist and a casual player have very different thresholds for what makes a game worth their money. Therefore, we could not simply use price or ratings as proxies, and we went through many rounds of discussion to design a model that was as unbiased as possible.
+
+Our solution was to use weak labels derived from the knowledge graph itself. For training, we used llama3 generated review scores on BGG forum reviews and extended the signal using community price behavior features and demand indicators (owns, wants, want-to-buy, want-to-trade ratios). We used the final scores provided in BGQ reviews as ground truth for a subset of games, along with llama-generated review scores to evaluate our model. We iterated through several label-generation strategies, incorporating forum sentiment and review text to reduce bias. The first stage of this model predicted engagement first, and the second stage conditioned value on both engagement and price.
+
+Our second challenge was the scale of the project. The dataset was substantially larger than we had anticipated, which made running LLM inference on every review and forum post extremely time-intensive, creating a bottleneck in our progress. Initially, we were running our scripts overnight on hundreds of thousands of unstructured data.  
+
+To create a more efficient process, we decided to split the review data into chunks and process them in parallel. We also filtered out reviews of games that are also present in BGO and prioritized posts by recency to capture current sentiment. Additionally, we cached embeddings and intermediate model outputs so that partial reruns did not require full recomputation.
+
+## Lessons Learned
+Throughout our project, we learned several important lessons.  
+
+- Weak label design is just as important as model architecture. Investing time in carefully constructing ground-truth proxies paid off more than hyperparameter tuning.
+- Graph databases reward upfront ontology design. Retroactively adding node types or relationship properties to Neo4j was expensive (took a day for the graph to update), and defining the schema thoroughly before ingestion saved significant rework.
+- Filtering early beats processing everything. Prioritizing high-signal data (text-rich reviews, recent posts) and discarding low-signal data early reduced compute time substantially without degrading model quality.
+- Ratings are not “value”. Community ratings on BGG suffer from ceiling effects and systematic positivity bias. Incorporating price history, demand signals, and editorial review scores produced a richer and more actionable value metric.
+
+By incorporating all these key components, we were able to build a rich, efficient, and “fair” recommendation system. The final product goes beyond the knowledge graph itself by giving users two ways to search: a detailed filter panel for structured browsing and a natural-language chatbot for more conversational recommendations. Together, these tools help users to efficiently find board games that match their preferences and ensure a satisfactory result.
+
+
     
 
 
